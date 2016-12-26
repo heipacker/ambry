@@ -13,16 +13,19 @@
  */
 package com.github.ambry.store;
 
+import com.codahale.metrics.MetricRegistry;
 import com.github.ambry.clustermap.ClusterMap;
 import com.github.ambry.clustermap.PartitionId;
 import com.github.ambry.commons.BlobId;
+import com.github.ambry.config.StoreConfig;
+import com.github.ambry.config.VerifiableProperties;
 import com.github.ambry.messageformat.BlobData;
 import com.github.ambry.messageformat.BlobProperties;
 import com.github.ambry.messageformat.MessageFormatErrorCodes;
 import com.github.ambry.messageformat.MessageFormatException;
 import com.github.ambry.messageformat.MessageFormatRecord;
-import com.github.ambry.utils.Pair;
 import com.github.ambry.utils.SystemTime;
+import com.github.ambry.utils.Throttler;
 import com.github.ambry.utils.Utils;
 import java.io.DataInputStream;
 import java.io.EOFException;
@@ -36,9 +39,10 @@ import java.nio.channels.Channels;
 import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.List;
-import java.util.concurrent.ConcurrentHashMap;
+import java.util.Map;
+import java.util.Properties;
 import java.util.concurrent.TimeUnit;
-import org.apache.log4j.lf5.LogLevel;
+import java.util.concurrent.atomic.AtomicLong;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -46,66 +50,54 @@ import org.slf4j.LoggerFactory;
 /**
  * Helper class to assist in dumping data from index or log files
  */
-public class DumpDataHelper {
+class DumpDataHelper {
 
   private final ClusterMap _clusterMap;
-  private boolean avoidTraceLogging;
+  private Throttler throttler;
   private static final Logger logger = LoggerFactory.getLogger(DumpDataHelper.class);
 
-  public DumpDataHelper(ClusterMap clusterMap, boolean avoidTraceLogging) {
+  DumpDataHelper(ClusterMap clusterMap, int bytesPerSec) {
     this._clusterMap = clusterMap;
-    this.avoidTraceLogging = avoidTraceLogging;
+    if (bytesPerSec > 0) {
+      this.throttler = new Throttler(bytesPerSec, 100, true, SystemTime.getInstance());
+    } else if (bytesPerSec < 0) {
+      throw new IllegalArgumentException("BytesPerSec " + bytesPerSec + " cannot be negative ");
+    }
   }
 
   /**
    * Dumps all blobs in an index file
    * @param indexFileToDump the index file that needs to be parsed
    * @param blobList List of blobIds to be filtered for
-   * @param blobIdToMessageMap {@link HashMap} of BlobId to {@link IndexRecord} to hold the information
+   * @param blobIdToMessageMap {@link Map} of BlobId to {@link IndexRecord} to hold the information
    *                                          about blobs in the index after parsing
    * @return the total number of keys/records processed
+   * @throws Exception
    */
-  long dumpBlobsFromIndex(File indexFileToDump, ArrayList<String> blobList,
-      ConcurrentHashMap<String, IndexRecord> blobIdToMessageMap) {
+  long dumpBlobsFromIndex(File indexFileToDump, ArrayList<String> blobList, Map<String, IndexRecord> blobIdToMessageMap)
+      throws Exception {
+    StoreKeyFactory storeKeyFactory = Utils.getObj("com.github.ambry.commons.BlobIdFactory", _clusterMap);
+    StoreConfig config = new StoreConfig(new VerifiableProperties(new Properties()));
+    StoreMetrics metrics = new StoreMetrics(indexFileToDump.getParent(), new MetricRegistry());
+    IndexSegment segment = new IndexSegment(indexFileToDump, false, storeKeyFactory, config, metrics,
+        new Journal(indexFileToDump.getParent(), 0, 0));
+    List<MessageInfo> entries = new ArrayList<>();
+    segment.getEntriesSince(null, new FindEntriesCondition(Long.MAX_VALUE), entries, new AtomicLong(0));
     long numberOfKeysProcessed = 0;
-    try {
-      DataInputStream stream = new DataInputStream(new FileInputStream(indexFileToDump));
-      short version = stream.readShort();
-      logger.trace("version " + version);
-      if (version == 0) {
-        int keysize = stream.readInt();
-        int valueSize = stream.readInt();
-        long fileEndPointer = stream.readLong();
-        logger.trace("key size " + keysize);
-        logger.trace("value size " + valueSize);
-        logger.trace("file end pointer " + fileEndPointer);
-        int Crc_Size = 8;
-        StoreKeyFactory storeKeyFactory = Utils.getObj("com.github.ambry.commons.BlobIdFactory", _clusterMap);
-        while (stream.available() > Crc_Size) {
-          StoreKey key = storeKeyFactory.getStoreKey(stream);
-          byte[] value = new byte[IndexValue.Index_Value_Size_In_Bytes];
-          stream.read(value);
-          IndexValue blobValue = new IndexValue(ByteBuffer.wrap(value));
-          String msg =
-              "key " + key + " keySize(in bytes) " + key.sizeInBytes() + " value - offset " + blobValue.getOffset()
-                  + " size " + blobValue.getSize() + " Original Message Offset " + blobValue.getOriginalMessageOffset()
-                  + " Flag " + blobValue.isFlagSet(IndexValue.Flags.Delete_Index) + " LiveUntil "
-                  + blobValue.getTimeToLiveInMs();
-          boolean isDeleted = blobValue.isFlagSet(IndexValue.Flags.Delete_Index);
-          numberOfKeysProcessed++;
-
-          if (blobList == null || blobList.contains(key.toString())) {
-            blobIdToMessageMap.put(key.toString(),
-                new IndexRecord(msg, isDeleted, isExpired(blobValue.getTimeToLiveInMs())));
-          }
+    for (MessageInfo entry : entries) {
+      StoreKey key = entry.getStoreKey();
+      IndexValue value = segment.find(key);
+      boolean isDeleted = value.isFlagSet(IndexValue.Flags.Delete_Index);
+      numberOfKeysProcessed++;
+      if (blobList == null || blobList.size() == 0 || blobList.contains(key.toString())) {
+        IndexRecord indexRecord = new IndexRecord(value.toString(), isDeleted, isExpired(value.getExpiresAtMs()));
+        if (blobIdToMessageMap.containsKey(key.getID())) {
+          logger.error(
+              "Duplicate record found for same blob " + key.getID() + ". Prev record " + blobIdToMessageMap.get(
+                  key.getID()) + ", New record " + indexRecord);
         }
-        logger.trace("crc " + stream.readLong());
-        logger.trace("Total number of keys processed " + numberOfKeysProcessed);
+        blobIdToMessageMap.put(key.getID(), indexRecord);
       }
-    } catch (IOException ioException) {
-      logger.error("IOException thrown " + ioException.getStackTrace());
-    } catch (Exception exception) {
-      logger.error("Exception thrown " + exception.getStackTrace());
     }
     return numberOfKeysProcessed;
   }
@@ -119,10 +111,11 @@ public class DumpDataHelper {
    * @param filter {@code true} if filtering has to be done, {@code false} otherwise
    * @param blobIdToLogRecord {@link HashMap} of blobId to {@link LogBlobRecord} to hold the information about blobs
    *                                         in the log after parsing
+   * @param logRecord {@code true} if log record has to be logged, {@code false} otherwise
    * @throws IOException
    */
-  public void dumpLog(File file, long startOffset, long endOffset, ArrayList<String> blobs, boolean filter,
-      ConcurrentHashMap<String, LogBlobRecord> blobIdToLogRecord) throws IOException {
+  void dumpLog(File file, long startOffset, long endOffset, ArrayList<String> blobs, boolean filter,
+      Map<String, LogBlobRecord> blobIdToLogRecord, boolean logRecord) throws IOException {
     logger.info("Dumping log file " + file.getAbsolutePath());
     long currentOffset = 0;
     RandomAccessFile randomAccessFile = new RandomAccessFile(file, "r");
@@ -130,70 +123,72 @@ public class DumpDataHelper {
     boolean lastBlobFailed = false;
     if (startOffset != -1) {
       currentOffset = startOffset;
-      randomAccessFile.seek(currentOffset);
     }
     if (endOffset == -1) {
       endOffset = fileSize;
     }
     logger.info("Starting dumping from offset " + currentOffset);
     while (currentOffset < endOffset) {
-      long tempCurrentOffset = currentOffset;
-
       try {
-        BlobRecordInfo blobRecordInfo = readSingleRecordFromLog(randomAccessFile, currentOffset);
+        LogBlobRecordInfo logBlobRecordInfo = readSingleRecordFromLog(randomAccessFile, currentOffset);
         if (lastBlobFailed) {
           logger.info("Successful record found at " + currentOffset + " after some failures ");
         }
         lastBlobFailed = false;
-        if (!blobRecordInfo.isDeleted) {
+        if (!logBlobRecordInfo.isDeleted) {
           if (filter) {
-            if (blobs.contains(blobRecordInfo.blobId.getID())) {
-              logger.info(
-                  blobRecordInfo.messageHeader + "\n " + blobRecordInfo.blobId + "\n" + blobRecordInfo.blobProperty
-                      + "\n" + blobRecordInfo.userMetadata + "\n" + blobRecordInfo.blobDataOutput);
-              updateBlobIdToLogRecordMap(blobIdToLogRecord, blobRecordInfo.blobId.getID(), currentOffset,
-                  !blobRecordInfo.isDeleted, blobRecordInfo.isExpired);
+            if (blobs.contains(logBlobRecordInfo.blobId.getID())) {
+              if (logRecord) {
+                logger.info(logBlobRecordInfo.messageHeader + "\n " + logBlobRecordInfo.blobId + "\n"
+                    + logBlobRecordInfo.blobProperty + "\n" + logBlobRecordInfo.userMetadata + "\n"
+                    + logBlobRecordInfo.blobDataOutput);
+              }
+              updateBlobIdToLogRecordMap(blobIdToLogRecord, logBlobRecordInfo.blobId.getID(), currentOffset,
+                  !logBlobRecordInfo.isDeleted, logBlobRecordInfo.isExpired);
             }
           } else {
-            logger.info(
-                blobRecordInfo.messageHeader + "\n " + blobRecordInfo.blobId + "\n" + blobRecordInfo.blobProperty + "\n"
-                    + blobRecordInfo.userMetadata + "\n" + blobRecordInfo.blobDataOutput);
-            updateBlobIdToLogRecordMap(blobIdToLogRecord, blobRecordInfo.blobId.getID(), currentOffset,
-                !blobRecordInfo.isDeleted, blobRecordInfo.isExpired);
+            if (logRecord) {
+              logger.info(logBlobRecordInfo.messageHeader + "\n " + logBlobRecordInfo.blobId + "\n"
+                  + logBlobRecordInfo.blobProperty + "\n" + logBlobRecordInfo.userMetadata + "\n"
+                  + logBlobRecordInfo.blobDataOutput + " end offset " + (currentOffset
+                  + logBlobRecordInfo.totalRecordSize));
+              updateBlobIdToLogRecordMap(blobIdToLogRecord, logBlobRecordInfo.blobId.getID(), currentOffset,
+                  !logBlobRecordInfo.isDeleted, logBlobRecordInfo.isExpired);
+            }
           }
         } else {
           if (filter) {
-            if (blobs.contains(blobRecordInfo.blobId.getID())) {
-              logger.info(
-                  blobRecordInfo.messageHeader + "\n " + blobRecordInfo.blobId + "\n" + blobRecordInfo.deleteMsg,
-                  LogLevel.INFO);
-              updateBlobIdToLogRecordMap(blobIdToLogRecord, blobRecordInfo.blobId.getID(), currentOffset,
-                  !blobRecordInfo.isDeleted, blobRecordInfo.isExpired);
+            if (blobs.contains(logBlobRecordInfo.blobId.getID())) {
+              if (logRecord) {
+                logger.info(logBlobRecordInfo.messageHeader + "\n " + logBlobRecordInfo.blobId + "\n"
+                    + logBlobRecordInfo.deleteMsg);
+              }
+              updateBlobIdToLogRecordMap(blobIdToLogRecord, logBlobRecordInfo.blobId.getID(), currentOffset,
+                  !logBlobRecordInfo.isDeleted, logBlobRecordInfo.isExpired);
             }
           } else {
-            logger.info(blobRecordInfo.messageHeader + "\n " + blobRecordInfo.blobId + "\n" + blobRecordInfo.deleteMsg,
-                LogLevel.INFO);
-            updateBlobIdToLogRecordMap(blobIdToLogRecord, blobRecordInfo.blobId.getID(), currentOffset,
-                !blobRecordInfo.isDeleted, blobRecordInfo.isExpired);
+            if (logRecord) {
+              logger.info(logBlobRecordInfo.messageHeader + "\n " + logBlobRecordInfo.blobId + "\n"
+                  + logBlobRecordInfo.deleteMsg + " end offset " + (currentOffset + logBlobRecordInfo.totalRecordSize));
+            }
+            updateBlobIdToLogRecordMap(blobIdToLogRecord, logBlobRecordInfo.blobId.getID(), currentOffset,
+                !logBlobRecordInfo.isDeleted, logBlobRecordInfo.isExpired);
           }
         }
-        currentOffset += (blobRecordInfo.totalRecordSize);
+        currentOffset += (logBlobRecordInfo.totalRecordSize);
       } catch (IllegalArgumentException e) {
         if (!lastBlobFailed) {
           logger.error("Illegal arg exception thrown at  " + randomAccessFile.getChannel().position() + ", "
-              + "while reading blob starting at offset " + tempCurrentOffset + "with exception: " + e.getStackTrace());
+              + "while reading blob starting at offset " + currentOffset + "with exception: " + e.getStackTrace());
         }
-        randomAccessFile.seek(++tempCurrentOffset);
-        currentOffset = tempCurrentOffset;
+        currentOffset++;
         lastBlobFailed = true;
       } catch (MessageFormatException e) {
         if (!lastBlobFailed) {
           logger.error("MessageFormat exception thrown at  " + randomAccessFile.getChannel().position()
-              + " while reading blob starting at offset " + tempCurrentOffset + " with exception: "
-              + e.getStackTrace());
+              + " while reading blob starting at offset " + currentOffset + " with exception: " + e.getStackTrace());
         }
-        randomAccessFile.seek(++tempCurrentOffset);
-        currentOffset = tempCurrentOffset;
+        currentOffset++;
         lastBlobFailed = true;
       } catch (EOFException e) {
         e.printStackTrace();
@@ -206,10 +201,9 @@ public class DumpDataHelper {
           logger.error(
               "Unknown exception thrown with Cause " + e.getCause() + ", Msg :" + e.getMessage() + ", stacktrace "
                   + e.getStackTrace());
-          logger.error("Trying out next offset " + (tempCurrentOffset + 1));
+          logger.info("Trying out next offset " + (currentOffset + 1));
         }
-        randomAccessFile.seek(++tempCurrentOffset);
-        currentOffset = tempCurrentOffset;
+        currentOffset++;
         lastBlobFailed = true;
       }
     }
@@ -217,46 +211,15 @@ public class DumpDataHelper {
   }
 
   /**
-   * Holds information about a blob record in the log
-   */
-  private class BlobRecordInfo {
-    String messageHeader = null;
-    BlobId blobId = null;
-    String blobProperty = null;
-    String userMetadata = null;
-    String blobDataOutput = null;
-    String deleteMsg = null;
-    boolean isDeleted;
-    boolean isExpired;
-    long timeToLiveInSeconds;
-    int totalRecordSize;
-
-    public BlobRecordInfo(String messageHeader, BlobId blobId, String blobProperty, String userMetadata,
-        String blobDataOutput, String deleteMsg, boolean isDeleted, boolean isExpired, long timeToLiveInSeconds,
-        int totalRecordSize) {
-      this.messageHeader = messageHeader;
-      this.blobId = blobId;
-      this.blobProperty = blobProperty;
-      this.userMetadata = userMetadata;
-      this.blobDataOutput = blobDataOutput;
-      this.deleteMsg = deleteMsg;
-      this.isDeleted = isDeleted;
-      this.isExpired = isExpired;
-      this.timeToLiveInSeconds = timeToLiveInSeconds;
-      this.totalRecordSize = totalRecordSize;
-    }
-  }
-
-  /**
    * Fetches one blob record from the log
    * @param randomAccessFile {@link RandomAccessFile} referring to the log file
    * @param currentOffset the offset at which to read the record from
-   * @return the {@link BlobRecordInfo} containing the blob record info
+   * @return the {@link LogBlobRecordInfo} containing the blob record info
    * @throws IOException
    * @throws MessageFormatException
    */
-  private BlobRecordInfo readSingleRecordFromLog(RandomAccessFile randomAccessFile, long currentOffset)
-      throws IOException, MessageFormatException {
+  LogBlobRecordInfo readSingleRecordFromLog(RandomAccessFile randomAccessFile, long currentOffset)
+      throws IOException, MessageFormatException, InterruptedException {
     String messageheader = null;
     BlobId blobId = null;
     String blobProperty = null;
@@ -267,6 +230,7 @@ public class DumpDataHelper {
     boolean isExpired = false;
     long timeToLiveInSeconds = -1;
     int totalRecordSize = 0;
+    randomAccessFile.seek(currentOffset);
     short version = randomAccessFile.readShort();
     if (version == 1) {
       ByteBuffer buffer = ByteBuffer.allocate(MessageFormatRecord.MessageHeader_Format_V1.getHeaderSize());
@@ -303,8 +267,11 @@ public class DumpDataHelper {
     } else {
       throw new MessageFormatException("Header version not supported " + version, MessageFormatErrorCodes.IO_Error);
     }
-    return new BlobRecordInfo(messageheader, blobId, blobProperty, usermetadata, blobDataOutput, deleteMsg, isDeleted,
-        isExpired, timeToLiveInSeconds, totalRecordSize);
+    if (throttler != null) {
+      throttler.maybeThrottle(totalRecordSize);
+    }
+    return new LogBlobRecordInfo(messageheader, blobId, blobProperty, usermetadata, blobDataOutput, deleteMsg,
+        isDeleted, isExpired, timeToLiveInSeconds, totalRecordSize);
   }
 
   /**
@@ -312,7 +279,7 @@ public class DumpDataHelper {
    * @param replicaTokenFile the file that needs to be parsed for
    * @throws Exception
    */
-  public void dumpReplicaToken(File replicaTokenFile) throws Exception {
+  void dumpReplicaToken(File replicaTokenFile) throws Exception {
     logger.info("Dumping replica token");
     DataInputStream stream = new DataInputStream(new FileInputStream(replicaTokenFile));
     short version = stream.readShort();
@@ -346,42 +313,41 @@ public class DumpDataHelper {
   /**
    * Dumps a single record from the log at a given offset and verifies for corresponding values in index
    * @param randomAccessFile the {@link RandomAccessFile} referring to log file that needs to be parsed
-   * @param offset the offset at which the record needs to be parsed for
    * @param blobId the blobId which that is expected to be matched for the record present at
    *               <code>offset</code>
    * @param indexValue the {@link IndexValue} that needs to be compared against
+   * @param coveredRanges a {@link Map} of startOffset to endOffset of ranges covered by records in the log
    * @throws IOException
    */
-  public boolean readFromLogAndVerify(RandomAccessFile randomAccessFile, long offset, String blobId,
-      IndexValue indexValue, DumpData.MergedIntervals coveredRangeInLog) throws Exception {
+  boolean readFromLogAndVerify(RandomAccessFile randomAccessFile, String blobId, IndexValue indexValue,
+      Map<Long, Long> coveredRanges) throws Exception {
+    long offset = indexValue.getOffset().getOffset();
     try {
-      randomAccessFile.seek(offset);
-      BlobRecordInfo blobRecordInfo = readSingleRecordFromLog(randomAccessFile, offset);
-      if (coveredRangeInLog != null) {
-        coveredRangeInLog.addInterval(new Pair(offset, offset + blobRecordInfo.totalRecordSize));
+      LogBlobRecordInfo logBlobRecordInfo = readSingleRecordFromLog(randomAccessFile, offset);
+      if (coveredRanges != null) {
+        coveredRanges.put(offset, offset + logBlobRecordInfo.totalRecordSize);
       }
-      compareIndexValueToLogEntry(blobId, indexValue, blobRecordInfo);
-      if (!blobRecordInfo.isDeleted) {
-        logger.trace(
-            blobRecordInfo.messageHeader + "\n " + blobRecordInfo.blobId.getID() + "\n" + blobRecordInfo.blobProperty
-                + "\n" + blobRecordInfo.userMetadata + "\n" + blobRecordInfo.blobDataOutput);
+      compareIndexValueToLogEntry(blobId, indexValue, logBlobRecordInfo);
+      if (!logBlobRecordInfo.isDeleted) {
+        logger.trace("{}", logBlobRecordInfo.messageHeader + "\n " + logBlobRecordInfo.blobId.getID() + "\n"
+            + logBlobRecordInfo.blobProperty + "\n" + logBlobRecordInfo.userMetadata + "\n"
+            + logBlobRecordInfo.blobDataOutput);
       } else {
-        logger.trace(
-            blobRecordInfo.messageHeader + "\n " + blobRecordInfo.blobId.getID() + "\n" + blobRecordInfo.deleteMsg,
-            LogLevel.DEBUG);
+        logger.trace("{}", logBlobRecordInfo.messageHeader + "\n " + logBlobRecordInfo.blobId.getID() + "\n"
+            + logBlobRecordInfo.deleteMsg);
       }
       return true;
     } catch (IllegalArgumentException e) {
       logger.error("Illegal arg exception thrown at  " + randomAccessFile.getChannel().position() + ", "
-          + "while reading blob starting at offset " + offset + " with exception: " + e.getStackTrace());
+          + "while reading blob starting at offset " + offset + " with exception: ", e);
     } catch (MessageFormatException e) {
       logger.error("MessageFormat exception thrown at  " + randomAccessFile.getChannel().position()
-          + " while reading blob starting at offset " + offset + " with exception: " + e.getStackTrace());
+          + " while reading blob starting at offset " + offset + " with exception: ", e);
     } catch (EOFException e) {
-      logger.error("EOFException thrown at " + randomAccessFile.getChannel().position() + " " + e.getStackTrace());
+      logger.error("EOFException thrown at " + randomAccessFile.getChannel().position() + " ", e);
       throw (e);
     } catch (Exception e) {
-      logger.error("Unknown exception thrown " + e.getMessage() + " " + e.getStackTrace());
+      logger.error("Unknown exception thrown " + e.getMessage() + " ", e);
     }
     return false;
   }
@@ -390,36 +356,39 @@ public class DumpDataHelper {
    * Compares values from index to that in the Log
    * @param blobId the blobId for which comparison is made
    * @param indexValue the {@link IndexValue} to be used in comparison
-   * @param blobRecordInfo the {@link BlobRecordInfo} to be used in comparison
+   * @param logBlobRecordInfo the {@link LogBlobRecordInfo} to be used in comparison
    */
-  private void compareIndexValueToLogEntry(String blobId, IndexValue indexValue, BlobRecordInfo blobRecordInfo) {
+  private void compareIndexValueToLogEntry(String blobId, IndexValue indexValue, LogBlobRecordInfo logBlobRecordInfo) {
     boolean isDeleted = indexValue.isFlagSet(IndexValue.Flags.Delete_Index);
-    boolean isExpired = isExpired(indexValue.getTimeToLiveInMs());
-    if (isDeleted != blobRecordInfo.isDeleted) {
-      logger.error("Deleted value mismatch for " + blobRecordInfo.blobId + " Index value " + isDeleted + ", Log value "
-          + blobRecordInfo.isDeleted);
-    } else if (!blobRecordInfo.isDeleted && isExpired != blobRecordInfo.isExpired) {
+    boolean isExpired = isExpired(indexValue.getExpiresAtMs());
+    if (isDeleted != logBlobRecordInfo.isDeleted) {
       logger.error(
-          "Expiration value mismatch for " + blobRecordInfo.blobId + " Index value " + isExpired + ", Log value "
-              + blobRecordInfo.isExpired + ", index TTL in ms " + indexValue.getTimeToLiveInMs()
-              + ", log Time to live in secs " + blobRecordInfo.timeToLiveInSeconds + ", in ms "
-              + TimeUnit.SECONDS.toMillis(blobRecordInfo.timeToLiveInSeconds));
-    } else if (!blobId.equals(blobRecordInfo.blobId.getID())) {
-      logger.error("BlobId value mismatch for " + blobRecordInfo.blobId + " Index value " + blobId + ", Log value "
-          + blobRecordInfo.blobId);
+          "Deleted value mismatch for " + logBlobRecordInfo.blobId + " Index value " + isDeleted + ", Log value "
+              + logBlobRecordInfo.isDeleted);
+    } else if (!logBlobRecordInfo.isDeleted && isExpired != logBlobRecordInfo.isExpired) {
+      logger.error(
+          "Expiration value mismatch for " + logBlobRecordInfo.blobId + " Index value " + isExpired + ", Log value "
+              + logBlobRecordInfo.isExpired + ", index TTL in ms " + indexValue.getExpiresAtMs()
+              + ", log Time to live in secs " + logBlobRecordInfo.timeToLiveInSeconds + ", in ms "
+              + TimeUnit.SECONDS.toMillis(logBlobRecordInfo.timeToLiveInSeconds));
+    } else if (!blobId.equals(logBlobRecordInfo.blobId.getID())) {
+      logger.error("BlobId value mismatch for " + logBlobRecordInfo.blobId + " Index value " + blobId + ", Log value "
+          + logBlobRecordInfo.blobId);
     }
   }
 
   /**
-   * Updates the {@link ConcurrentHashMap} of blobIds to {@link LogBlobRecord} with the information about the passed in <code>blobId</code>
-   * @param blobIdToLogRecord {@link HashMap} of blobId to {@link LogBlobRecord} that needs to be updated with the information about the blob
-   * @param blobId the blobId of the blob that needs to be updated in the {@link ConcurrentHashMap}
+   * Updates the {@link Map} of blobIds to {@link LogBlobRecord} with the information about the passed in
+   * <code>blobId</code>
+   * @param blobIdToLogRecord {@link HashMap} of blobId to {@link LogBlobRecord} that needs to be updated with the
+   *                                         information about the blob
+   * @param blobId the blobId of the blob that needs to be updated in the {@link Map}
    * @param offset the offset at which the blob record was parsed from in the log file
    * @param putRecord {@code true} if the record is a Put record, {@code false} otherwise (incase of a Delete record)
    * @param isExpired {@code true} if the blob has expired, {@code false} otherwise
    */
-  private void updateBlobIdToLogRecordMap(ConcurrentHashMap<String, LogBlobRecord> blobIdToLogRecord, String blobId,
-      Long offset, boolean putRecord, boolean isExpired) {
+  private void updateBlobIdToLogRecordMap(Map<String, LogBlobRecord> blobIdToLogRecord, String blobId, Long offset,
+      boolean putRecord, boolean isExpired) {
     if (blobIdToLogRecord != null) {
       if (blobIdToLogRecord.containsKey(blobId)) {
         if (putRecord) {
@@ -500,7 +469,7 @@ public class DumpDataHelper {
         this.isExpired = isExpired;
         isConsistent = true;
       } else {
-        isConsistent = false;
+        isConsistent = true;
         isDeleted = true;
         deleteMessageOffsets.add(offset);
       }
