@@ -80,6 +80,7 @@ class PersistentIndex {
   final ConcurrentSkipListMap<Offset, IndexSegment> indexes = new ConcurrentSkipListMap<>();
   final Journal journal;
   final HardDeleter hardDeleter;
+  final Thread hardDeleteThread;
 
   private final Log log;
   private final Offset logAbsoluteZeroOffset;
@@ -92,6 +93,7 @@ class PersistentIndex {
   private final boolean cleanShutdown;
   private final Offset logEndOffsetOnStartup;
   private final StoreMetrics metrics;
+  private final UUID incarnationId;
   private final Time time;
 
   private final UUID sessionId = UUID.randomUUID();
@@ -109,11 +111,12 @@ class PersistentIndex {
    * @param hardDelete  The hard delete handle used to perform hard deletes
    * @param metrics the metrics object
    * @param time the time instance to use
+   * @param incarnationId to uniquely identify the store's incarnation
    * @throws StoreException
    */
   PersistentIndex(String datadir, ScheduledExecutorService scheduler, Log log, StoreConfig config,
       StoreKeyFactory factory, MessageStoreRecovery recovery, MessageStoreHardDelete hardDelete, StoreMetrics metrics,
-      Time time) throws StoreException {
+      Time time, UUID incarnationId) throws StoreException {
     /*
     If a put and a delete of a key happens within the same segment, the segment will have only one entry for it,
     whereas the journal keeps both. In order to account for this, and to ensure that the journal always has all the
@@ -122,7 +125,7 @@ class PersistentIndex {
     */
     this(datadir, scheduler, log, config, factory, recovery, hardDelete, metrics,
         new Journal(datadir, 2 * config.storeIndexMaxNumberOfInmemElements,
-            config.storeMaxNumberOfEntriesToReturnFromJournal), time);
+            config.storeMaxNumberOfEntriesToReturnFromJournal), time, incarnationId);
   }
 
   /**
@@ -137,11 +140,12 @@ class PersistentIndex {
    * @param metrics the metrics object
    * @param journal the journal to use
    * @param time the time instance to use
+   * @param incarnationId to uniquely identify the store's incarnation
    * @throws StoreException
    */
   PersistentIndex(String datadir, ScheduledExecutorService scheduler, Log log, StoreConfig config,
       StoreKeyFactory factory, MessageStoreRecovery recovery, MessageStoreHardDelete hardDelete, StoreMetrics metrics,
-      Journal journal, Time time) throws StoreException {
+      Journal journal, Time time, UUID incarnationId) throws StoreException {
     File[] indexFiles = new File(datadir).listFiles(INDEX_FILE_FILTER);
     if (indexFiles == null) {
       throw new StoreException("Could not read index files from directory [" + datadir + "]",
@@ -157,6 +161,7 @@ class PersistentIndex {
       this.config = config;
       this.hardDelete = hardDelete;
       this.journal = journal;
+      this.incarnationId = incarnationId;
       this.maxInMemoryIndexSizeInBytes = config.storeIndexMaxMemorySizeBytes;
       this.maxInMemoryNumElements = config.storeIndexMaxNumberOfInmemElements;
 
@@ -200,9 +205,10 @@ class PersistentIndex {
           config.storeDataFlushIntervalSeconds, TimeUnit.SECONDS);
       if (config.storeEnableHardDelete) {
         logger.info("Index : " + datadir + " Starting hard delete thread ");
-        Thread hardDeleteThread = Utils.newThread("hard delete thread " + datadir, hardDeleter, true);
+        hardDeleteThread = Utils.newThread("hard delete thread " + datadir, hardDeleter, true);
         hardDeleteThread.start();
       } else {
+        hardDeleteThread = null;
         hardDeleter.close();
       }
       metrics.initializeHardDeleteMetric(hardDeleter, log);
@@ -407,7 +413,9 @@ class PersistentIndex {
                 true).descendingMap();
         metrics.segmentSizeForExists.update(segmentsMapToSearch.size());
       }
+      int segmentsSearched = 0;
       for (Map.Entry<Offset, IndexSegment> entry : segmentsMapToSearch.entrySet()) {
+        segmentsSearched++;
         logger.trace("Index : {} searching index with start offset {}", dataDir, entry.getKey());
         IndexValue value = entry.getValue().find(key);
         if (value != null) {
@@ -425,6 +433,7 @@ class PersistentIndex {
           }
         }
       }
+      metrics.segmentsAccessedPerBlobCount.update(segmentsSearched);
     } finally {
       context.stop();
     }
@@ -576,45 +585,20 @@ class PersistentIndex {
   FindInfo findEntriesSince(FindToken token, long maxTotalSizeOfEntries) throws StoreException {
     long startTimeInMs = time.milliseconds();
     try {
-      boolean tokenWasReset = false;
       Offset logEndOffsetBeforeFind = log.getEndOffset();
-      StoreFindToken storeToken = (StoreFindToken) token;
-      // validate token
-      if (storeToken.getSessionId() == null || storeToken.getSessionId().compareTo(sessionId) != 0) {
-        // the session has changed. check if we had an unclean shutdown on startup
-        if (!cleanShutdown) {
-          // if we had an unclean shutdown and the token offset is larger than the logEndOffsetOnStartup
-          // we reset the token to logEndOffsetOnStartup
-          if (!storeToken.getType().equals(StoreFindToken.Type.Uninitialized)
-              && storeToken.getOffset().compareTo(logEndOffsetOnStartup) > 0) {
-            logger.info("Index : " + dataDir + " resetting offset after not clean shutdown " + logEndOffsetOnStartup
-                + " before offset " + storeToken.getOffset());
-            storeToken = new StoreFindToken(logEndOffsetOnStartup, sessionId);
-            tokenWasReset = true;
-          }
-        } else if (!storeToken.getType().equals(StoreFindToken.Type.Uninitialized)
-            && storeToken.getOffset().compareTo(logEndOffsetOnStartup) > 0) {
-          logger.error(
-              "Index : " + dataDir + " invalid token. Provided offset is outside the log range after clean shutdown");
-          // if the shutdown was clean, the offset should always be lesser or equal to the logEndOffsetOnStartup
-          throw new IllegalArgumentException(
-              "Invalid token. Provided offset is outside the log range after clean shutdown");
-        }
-      }
+      StoreFindToken storeToken = resetTokenIfRequired((StoreFindToken) token);
       logger.trace("Time used to validate token: {}", (time.milliseconds() - startTimeInMs));
 
       List<MessageInfo> messageEntries = new ArrayList<MessageInfo>();
       if (!storeToken.getType().equals(StoreFindToken.Type.IndexBased)) {
         startTimeInMs = time.milliseconds();
-        boolean inclusive = tokenWasReset;
         Offset offsetToStart = storeToken.getOffset();
         if (storeToken.getType().equals(StoreFindToken.Type.Uninitialized)) {
           offsetToStart = log.getStartOffset();
-          inclusive = true;
         }
         logger.trace("Index : " + dataDir + " getting entries since " + offsetToStart);
         // check journal
-        List<JournalEntry> entries = journal.getEntriesSince(offsetToStart, inclusive);
+        List<JournalEntry> entries = journal.getEntriesSince(offsetToStart, storeToken.getInclusive());
         logger.trace("Journal based token, Time used to get entries: {}", (time.milliseconds() - startTimeInMs));
 
         if (entries != null) {
@@ -644,7 +628,7 @@ class PersistentIndex {
           logger.trace("Journal based token, Time used to eliminate duplicates: {}",
               (time.milliseconds() - startTimeInMs));
 
-          StoreFindToken storeFindToken = new StoreFindToken(offsetEnd, sessionId);
+          StoreFindToken storeFindToken = new StoreFindToken(offsetEnd, sessionId, incarnationId, false);
           long bytesRead = getTotalBytesRead(storeFindToken, messageEntries, logEndOffsetBeforeFind);
           storeFindToken.setBytesRead(bytesRead);
           return new FindInfo(messageEntries, storeFindToken);
@@ -667,7 +651,6 @@ class PersistentIndex {
           } else {
             newToken = storeToken;
           }
-
           startTimeInMs = time.milliseconds();
           eliminateDuplicates(messageEntries);
           logger.trace("Journal based to segment based token, Time used to eliminate duplicates: {}",
@@ -706,6 +689,44 @@ class PersistentIndex {
       throw new StoreException("Unknown error when finding entries for index " + dataDir, e,
           StoreErrorCodes.Unknown_Error);
     }
+  }
+
+  /**
+   * Validate the {@link StoreFindToken} and reset if required
+   * @param storeToken the {@link StoreFindToken} that needs to be validated
+   * @return the new {@link StoreFindToken} after validating
+   */
+  private StoreFindToken resetTokenIfRequired(StoreFindToken storeToken) {
+    UUID remoteIncarnationId = storeToken.getIncarnationId();
+    // if incarnationId is null, for backwards compatibility purposes, the token is considered as good.
+    /// if not null, we check for a match
+    if (!storeToken.getType().equals(StoreFindToken.Type.Uninitialized) && remoteIncarnationId != null
+        && !remoteIncarnationId.equals(incarnationId)) {
+      // incarnationId mismatch, hence resetting the token to beginning
+      logger.info("Index : {} resetting offset after incarnation, new incarnation Id {}, "
+          + "incarnationId from store token {}", dataDir, incarnationId, remoteIncarnationId);
+      storeToken = new StoreFindToken();
+    } else if (storeToken.getSessionId() == null || storeToken.getSessionId().compareTo(sessionId) != 0) {
+      // the session has changed. check if we had an unclean shutdown on startup
+      if (!cleanShutdown) {
+        // if we had an unclean shutdown and the token offset is larger than the logEndOffsetOnStartup
+        // we reset the token to logEndOffsetOnStartup
+        if (!storeToken.getType().equals(StoreFindToken.Type.Uninitialized)
+            && storeToken.getOffset().compareTo(logEndOffsetOnStartup) > 0) {
+          logger.info("Index : " + dataDir + " resetting offset after not clean shutdown " + logEndOffsetOnStartup
+              + " before offset " + storeToken.getOffset());
+          storeToken = new StoreFindToken(logEndOffsetOnStartup, sessionId, incarnationId, true);
+        }
+      } else if (!storeToken.getType().equals(StoreFindToken.Type.Uninitialized)
+          && storeToken.getOffset().compareTo(logEndOffsetOnStartup) > 0) {
+        logger.error(
+            "Index : " + dataDir + " invalid token. Provided offset is outside the log range after clean shutdown");
+        // if the shutdown was clean, the offset should always be lesser or equal to the logEndOffsetOnStartup
+        throw new IllegalArgumentException(
+            "Invalid token. Provided offset is outside the log range after clean shutdown");
+      }
+    }
+    return storeToken;
   }
 
   private long getTotalBytesRead(StoreFindToken newToken, List<MessageInfo> messageEntries,
@@ -823,7 +844,7 @@ class PersistentIndex {
       }
     }
     if (newTokenOffsetInJournal != null) {
-      return new StoreFindToken(newTokenOffsetInJournal, sessionId);
+      return new StoreFindToken(newTokenOffsetInJournal, sessionId, incarnationId, false);
     } else if (messageEntries.size() == 0 && !findEntriesCondition.hasEndTime()) {
       // If the condition does not have an endtime, then since we have entered a segment, we should return at least one
       // message
@@ -835,7 +856,7 @@ class PersistentIndex {
       // uninitialized token
       return newTokenSegmentStartOffset == null ? new StoreFindToken()
           : new StoreFindToken(messageEntries.get(messageEntries.size() - 1).getStoreKey(), newTokenSegmentStartOffset,
-              sessionId);
+              sessionId, incarnationId);
     }
   }
 
@@ -1001,7 +1022,7 @@ class PersistentIndex {
               break;
             }
           }
-          newToken = new StoreFindToken(offsetEnd, sessionId);
+          newToken = new StoreFindToken(offsetEnd, sessionId, incarnationId, false);
         } else {
           // Case 3: offset based, but offset out of journal
           Map.Entry<Offset, IndexSegment> entry = indexes.floorEntry(offsetToStart);
@@ -1027,6 +1048,14 @@ class PersistentIndex {
     }
   }
 
+  /**
+   * Persists index files to disk.
+   * @throws StoreException
+   */
+  void persistIndex() throws StoreException {
+    persistor.write();
+  }
+
   private class IndexPersistor implements Runnable {
 
     /**
@@ -1035,7 +1064,7 @@ class PersistentIndex {
      * The last index segment is flushed whenever write is invoked.
      * @throws StoreException
      */
-    public void write() throws StoreException {
+    public synchronized void write() throws StoreException {
       final Timer.Context context = metrics.indexFlushTime.time();
       try {
         if (indexes.size() > 0) {

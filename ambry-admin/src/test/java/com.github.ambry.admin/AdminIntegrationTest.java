@@ -17,15 +17,16 @@ import com.github.ambry.clustermap.ClusterMap;
 import com.github.ambry.clustermap.MockClusterMap;
 import com.github.ambry.commons.ByteBufferReadableStreamChannel;
 import com.github.ambry.commons.LoggingNotificationSystem;
+import com.github.ambry.config.AdminConfig;
 import com.github.ambry.config.VerifiableProperties;
 import com.github.ambry.messageformat.BlobProperties;
 import com.github.ambry.protocol.GetOption;
 import com.github.ambry.rest.NettyClient;
 import com.github.ambry.rest.RestServer;
-import com.github.ambry.rest.RestTestUtils;
 import com.github.ambry.rest.RestUtils;
 import com.github.ambry.router.InMemoryRouter;
 import com.github.ambry.router.InMemoryRouterFactory;
+import com.github.ambry.utils.TestUtils;
 import com.github.ambry.utils.Utils;
 import com.github.ambry.utils.UtilsTest;
 import io.netty.buffer.ByteBuf;
@@ -34,11 +35,13 @@ import io.netty.handler.codec.http.DefaultFullHttpRequest;
 import io.netty.handler.codec.http.DefaultHttpHeaders;
 import io.netty.handler.codec.http.FullHttpRequest;
 import io.netty.handler.codec.http.HttpContent;
+import io.netty.handler.codec.http.HttpHeaderNames;
 import io.netty.handler.codec.http.HttpHeaders;
 import io.netty.handler.codec.http.HttpMethod;
 import io.netty.handler.codec.http.HttpObject;
 import io.netty.handler.codec.http.HttpResponse;
 import io.netty.handler.codec.http.HttpResponseStatus;
+import io.netty.handler.codec.http.HttpUtil;
 import io.netty.handler.codec.http.HttpVersion;
 import io.netty.handler.codec.http.LastHttpContent;
 import io.netty.util.ReferenceCountUtil;
@@ -70,6 +73,8 @@ import static org.junit.Assert.*;
 public class AdminIntegrationTest {
   private static final int SERVER_PORT = 16503;
   private static final ClusterMap CLUSTER_MAP;
+  private static final VerifiableProperties ADMIN_VERIFIABLE_PROPS = buildAdminVProps();
+  private static final AdminConfig ADMIN_CONFIG = new AdminConfig(ADMIN_VERIFIABLE_PROPS);
 
   static {
     try {
@@ -98,7 +103,7 @@ public class AdminIntegrationTest {
    */
   @BeforeClass
   public static void setup() throws Exception {
-    adminRestServer = new RestServer(buildAdminVProps(), CLUSTER_MAP, new LoggingNotificationSystem());
+    adminRestServer = new RestServer(ADMIN_VERIFIABLE_PROPS, CLUSTER_MAP, new LoggingNotificationSystem());
     router = InMemoryRouterFactory.getLatestInstance();
     adminRestServer.start();
     nettyClient = new NettyClient("localhost", SERVER_PORT);
@@ -126,14 +131,14 @@ public class AdminIntegrationTest {
     doGetHeadDeleteTest(0, false);
     doGetHeadDeleteTest(0, true);
 
-    doGetHeadDeleteTest(1024, false);
-    doGetHeadDeleteTest(1024, true);
+    doGetHeadDeleteTest(ADMIN_CONFIG.adminChunkedGetResponseThresholdInBytes - 1, false);
+    doGetHeadDeleteTest(ADMIN_CONFIG.adminChunkedGetResponseThresholdInBytes - 1, true);
 
-    doGetHeadDeleteTest(8192, false);
-    doGetHeadDeleteTest(8192, true);
+    doGetHeadDeleteTest(ADMIN_CONFIG.adminChunkedGetResponseThresholdInBytes, false);
+    doGetHeadDeleteTest(ADMIN_CONFIG.adminChunkedGetResponseThresholdInBytes, true);
 
-    doGetHeadDeleteTest(10000, false);
-    doGetHeadDeleteTest(8192, true);
+    doGetHeadDeleteTest(ADMIN_CONFIG.adminChunkedGetResponseThresholdInBytes * 3, false);
+    doGetHeadDeleteTest(ADMIN_CONFIG.adminChunkedGetResponseThresholdInBytes * 3, true);
   }
 
   /*
@@ -148,7 +153,7 @@ public class AdminIntegrationTest {
         new DefaultFullHttpRequest(HttpVersion.HTTP_1_1, HttpMethod.GET, "/healthCheck", Unpooled.buffer(0));
     Queue<HttpObject> responseParts = nettyClient.sendRequest(httpRequest, null, null).get();
     HttpResponse response = (HttpResponse) responseParts.poll();
-    assertEquals("Unexpected response status", HttpResponseStatus.OK, response.getStatus());
+    assertEquals("Unexpected response status", HttpResponseStatus.OK, response.status());
     ByteBuffer content = getContent(response, responseParts);
     assertEquals("GET content does not match original content", "GOOD", new String(content.array()));
   }
@@ -185,9 +190,9 @@ public class AdminIntegrationTest {
    * @return a {@link ByteBuffer} that contains all the data in {@code contents}.
    */
   private ByteBuffer getContent(HttpResponse response, Queue<HttpObject> contents) {
-    long contentLength = HttpHeaders.getContentLength(response, -1);
+    long contentLength = HttpUtil.getContentLength(response, -1);
     if (contentLength == -1) {
-      contentLength = HttpHeaders.getIntHeader(response, RestUtils.Headers.BLOB_SIZE, 0);
+      contentLength = response.headers().getInt(RestUtils.Headers.BLOB_SIZE, 0);
     }
     ByteBuffer buffer = ByteBuffer.allocate((int) contentLength);
     boolean endMarkerFound = false;
@@ -256,13 +261,13 @@ public class AdminIntegrationTest {
    * @throws Exception
    */
   private void doGetHeadDeleteTest(int contentSize, boolean multipartPost) throws Exception {
-    ByteBuffer content = ByteBuffer.wrap(RestTestUtils.getRandomBytes(contentSize));
+    ByteBuffer content = ByteBuffer.wrap(TestUtils.getRandomBytes(contentSize));
     String serviceId = "getHeadDeleteServiceID";
     String contentType = "application/octet-stream";
     String ownerId = "getHeadDeleteOwnerID";
     HttpHeaders headers = new DefaultHttpHeaders();
     setAmbryHeaders(headers, content.capacity(), 7200, false, serviceId, contentType, ownerId);
-    headers.set(HttpHeaders.Names.CONTENT_LENGTH, content.capacity());
+    headers.set(HttpHeaderNames.CONTENT_LENGTH, content.capacity());
     String blobId;
     byte[] usermetadata = null;
     if (multipartPost) {
@@ -273,7 +278,7 @@ public class AdminIntegrationTest {
     }
     blobId = putBlob(headers, content, usermetadata);
     getBlobAndVerify(blobId, null, headers, content);
-    getNotModifiedBlobAndVerify(blobId, null);
+    getNotModifiedBlobAndVerify(blobId, null, false);
     getUserMetadataAndVerify(blobId, null, headers, usermetadata);
     getBlobInfoAndVerify(blobId, null, headers, usermetadata);
     getHeadAndVerify(blobId, null, headers);
@@ -357,24 +362,26 @@ public class AdminIntegrationTest {
     FullHttpRequest httpRequest = buildRequest(HttpMethod.GET, blobId, headers, null);
     Queue<HttpObject> responseParts = nettyClient.sendRequest(httpRequest, null, null).get();
     HttpResponse response = (HttpResponse) responseParts.poll();
-    assertEquals("Unexpected response status", HttpResponseStatus.OK, response.getStatus());
+    assertEquals("Unexpected response status", HttpResponseStatus.OK, response.status());
     checkCommonGetHeadHeaders(response.headers());
     assertEquals("Content-Type does not match", expectedHeaders.get(RestUtils.Headers.AMBRY_CONTENT_TYPE),
-        response.headers().get(HttpHeaders.Names.CONTENT_TYPE));
+        response.headers().get(HttpHeaderNames.CONTENT_TYPE));
     assertEquals(RestUtils.Headers.BLOB_SIZE + " does not match", expectedHeaders.get(RestUtils.Headers.BLOB_SIZE),
         response.headers().get(RestUtils.Headers.BLOB_SIZE));
     ByteBuffer responseContent = getContent(response, responseParts);
     assertArrayEquals("GET content does not match original content", expectedContent.array(), responseContent.array());
-    assertTrue("Channel should be active", HttpHeaders.isKeepAlive(response));
+    verifyCacheHeaders(Boolean.parseBoolean(expectedHeaders.get(RestUtils.Headers.PRIVATE)), response);
+    assertTrue("Channel should be active", HttpUtil.isKeepAlive(response));
   }
 
   /**
    * Gets the blob with blob ID {@code blobId} and verifies that the blob is not returned as blob is not modified
    * @param blobId the blob ID of the blob to GET.
    * @param getOption the options to use while getting the blob.
+   * @param isPrivate {@code true} if the blob is private, {@code false} if not.
    * @throws Exception
    */
-  private void getNotModifiedBlobAndVerify(String blobId, GetOption getOption) throws Exception {
+  private void getNotModifiedBlobAndVerify(String blobId, GetOption getOption, boolean isPrivate) throws Exception {
     HttpHeaders headers = new DefaultHttpHeaders();
     if (getOption != null) {
       headers.add(RestUtils.Headers.GET_OPTION, getOption.toString());
@@ -383,12 +390,14 @@ public class AdminIntegrationTest {
     FullHttpRequest httpRequest = buildRequest(HttpMethod.GET, blobId, headers, null);
     Queue<HttpObject> responseParts = nettyClient.sendRequest(httpRequest, null, null).get();
     HttpResponse response = (HttpResponse) responseParts.poll();
-    assertEquals("Unexpected response status", HttpResponseStatus.NOT_MODIFIED, response.getStatus());
-    assertTrue("No Date header", response.headers().get(RestUtils.Headers.DATE) != null);
-    assertNull("No Last-Modified header expected", response.headers().get("Last-Modified"));
+    assertEquals("Unexpected response status", HttpResponseStatus.NOT_MODIFIED, response.status());
+    assertNotNull("Date header expected", response.headers().get(RestUtils.Headers.DATE));
+    assertNotNull("Last-Modified header expected", response.headers().get(RestUtils.Headers.LAST_MODIFIED));
     assertNull(RestUtils.Headers.BLOB_SIZE + " should have been null ",
         response.headers().get(RestUtils.Headers.BLOB_SIZE));
     assertNull("Content-Type should have been null", response.headers().get(RestUtils.Headers.CONTENT_TYPE));
+    assertNull("Content-Length should have been null", response.headers().get(RestUtils.Headers.CONTENT_TYPE));
+    verifyCacheHeaders(isPrivate, response);
     assertNoContent(responseParts);
   }
 
@@ -411,10 +420,10 @@ public class AdminIntegrationTest {
         buildRequest(HttpMethod.GET, blobId + "/" + RestUtils.SubResource.UserMetadata, headers, null);
     Queue<HttpObject> responseParts = nettyClient.sendRequest(httpRequest, null, null).get();
     HttpResponse response = (HttpResponse) responseParts.poll();
-    assertEquals("Unexpected response status", HttpResponseStatus.OK, response.getStatus());
+    assertEquals("Unexpected response status", HttpResponseStatus.OK, response.status());
     checkCommonGetHeadHeaders(response.headers());
     verifyUserMetadata(expectedHeaders, response, usermetadata, responseParts);
-    assertTrue("Channel should be active", HttpHeaders.isKeepAlive(response));
+    assertTrue("Channel should be active", HttpUtil.isKeepAlive(response));
   }
 
   /**
@@ -436,11 +445,11 @@ public class AdminIntegrationTest {
         buildRequest(HttpMethod.GET, blobId + "/" + RestUtils.SubResource.BlobInfo, headers, null);
     Queue<HttpObject> responseParts = nettyClient.sendRequest(httpRequest, null, null).get();
     HttpResponse response = (HttpResponse) responseParts.poll();
-    assertEquals("Unexpected response status", HttpResponseStatus.OK, response.getStatus());
+    assertEquals("Unexpected response status", HttpResponseStatus.OK, response.status());
     checkCommonGetHeadHeaders(response.headers());
     verifyBlobProperties(expectedHeaders, response);
     verifyUserMetadata(expectedHeaders, response, usermetadata, responseParts);
-    assertTrue("Channel should be active", HttpHeaders.isKeepAlive(response));
+    assertTrue("Channel should be active", HttpUtil.isKeepAlive(response));
   }
 
   /**
@@ -460,16 +469,16 @@ public class AdminIntegrationTest {
     FullHttpRequest httpRequest = buildRequest(HttpMethod.HEAD, blobId, headers, null);
     Queue<HttpObject> responseParts = nettyClient.sendRequest(httpRequest, null, null).get();
     HttpResponse response = (HttpResponse) responseParts.poll();
-    assertEquals("Unexpected response status", HttpResponseStatus.OK, response.getStatus());
+    assertEquals("Unexpected response status", HttpResponseStatus.OK, response.status());
     checkCommonGetHeadHeaders(response.headers());
     assertEquals(RestUtils.Headers.CONTENT_LENGTH + " does not match " + RestUtils.Headers.BLOB_SIZE,
-        Long.parseLong(expectedHeaders.get(RestUtils.Headers.BLOB_SIZE)), HttpHeaders.getContentLength(response));
+        Long.parseLong(expectedHeaders.get(RestUtils.Headers.BLOB_SIZE)), HttpUtil.getContentLength(response));
     assertEquals(RestUtils.Headers.CONTENT_TYPE + " does not match " + RestUtils.Headers.AMBRY_CONTENT_TYPE,
         expectedHeaders.get(RestUtils.Headers.AMBRY_CONTENT_TYPE),
-        HttpHeaders.getHeader(response, HttpHeaders.Names.CONTENT_TYPE));
+        response.headers().get(HttpHeaderNames.CONTENT_TYPE));
     verifyBlobProperties(expectedHeaders, response);
     discardContent(responseParts, 1);
-    assertTrue("Channel should be active", HttpHeaders.isKeepAlive(response));
+    assertTrue("Channel should be active", HttpUtil.isKeepAlive(response));
   }
 
   /**
@@ -479,23 +488,23 @@ public class AdminIntegrationTest {
    */
   private void verifyBlobProperties(HttpHeaders expectedHeaders, HttpResponse response) {
     assertEquals("Blob size does not match", Long.parseLong(expectedHeaders.get(RestUtils.Headers.BLOB_SIZE)),
-        Long.parseLong(HttpHeaders.getHeader(response, RestUtils.Headers.BLOB_SIZE)));
+        Long.parseLong(response.headers().get(RestUtils.Headers.BLOB_SIZE)));
     assertEquals(RestUtils.Headers.SERVICE_ID + " does not match", expectedHeaders.get(RestUtils.Headers.SERVICE_ID),
-        HttpHeaders.getHeader(response, RestUtils.Headers.SERVICE_ID));
+        response.headers().get(RestUtils.Headers.SERVICE_ID));
     assertEquals(RestUtils.Headers.PRIVATE + " does not match", expectedHeaders.get(RestUtils.Headers.PRIVATE),
-        HttpHeaders.getHeader(response, RestUtils.Headers.PRIVATE));
+        response.headers().get(RestUtils.Headers.PRIVATE));
     assertEquals(RestUtils.Headers.AMBRY_CONTENT_TYPE + " does not match",
         expectedHeaders.get(RestUtils.Headers.AMBRY_CONTENT_TYPE),
-        HttpHeaders.getHeader(response, RestUtils.Headers.AMBRY_CONTENT_TYPE));
+        response.headers().get(RestUtils.Headers.AMBRY_CONTENT_TYPE));
     assertTrue("No " + RestUtils.Headers.CREATION_TIME,
-        HttpHeaders.getHeader(response, RestUtils.Headers.CREATION_TIME, null) != null);
+        response.headers().get(RestUtils.Headers.CREATION_TIME, null) != null);
     if (Long.parseLong(expectedHeaders.get(RestUtils.Headers.TTL)) != Utils.Infinite_Time) {
       assertEquals(RestUtils.Headers.TTL + " does not match", expectedHeaders.get(RestUtils.Headers.TTL),
-          HttpHeaders.getHeader(response, RestUtils.Headers.TTL));
+          response.headers().get(RestUtils.Headers.TTL));
     }
     if (expectedHeaders.contains(RestUtils.Headers.OWNER_ID)) {
       assertEquals(RestUtils.Headers.OWNER_ID + " does not match", expectedHeaders.get(RestUtils.Headers.OWNER_ID),
-          HttpHeaders.getHeader(response, RestUtils.Headers.OWNER_ID));
+          response.headers().get(RestUtils.Headers.OWNER_ID));
     }
   }
 
@@ -509,12 +518,12 @@ public class AdminIntegrationTest {
   private void verifyUserMetadata(HttpHeaders expectedHeaders, HttpResponse response, byte[] usermetadata,
       Queue<HttpObject> content) {
     if (usermetadata == null) {
-      assertEquals("Content-Length is not 0", 0, HttpHeaders.getContentLength(response));
+      assertEquals("Content-Length is not 0", 0, HttpUtil.getContentLength(response));
       for (Map.Entry<String, String> header : expectedHeaders) {
         String key = header.getKey();
         if (key.startsWith(RestUtils.Headers.USER_META_DATA_HEADER_PREFIX)) {
           assertEquals("Value for " + key + " does not match in user metadata", header.getValue(),
-              HttpHeaders.getHeader(response, key));
+              response.headers().get(key));
         }
       }
       for (Map.Entry<String, String> header : response.headers()) {
@@ -525,7 +534,7 @@ public class AdminIntegrationTest {
       }
       discardContent(content, 1);
     } else {
-      assertEquals("Content-Length is not as expected", usermetadata.length, HttpHeaders.getContentLength(response));
+      assertEquals("Content-Length is not as expected", usermetadata.length, HttpUtil.getContentLength(response));
       byte[] receivedMetadata = getContent(response, content).array();
       assertArrayEquals("User metadata does not match original", usermetadata, receivedMetadata);
     }
@@ -564,7 +573,7 @@ public class AdminIntegrationTest {
     GetOption[] options = {GetOption.Include_Deleted_Blobs, GetOption.Include_All};
     for (GetOption option : options) {
       getBlobAndVerify(blobId, option, expectedHeaders, expectedContent);
-      getNotModifiedBlobAndVerify(blobId, option);
+      getNotModifiedBlobAndVerify(blobId, option, Boolean.parseBoolean(expectedHeaders.get(RestUtils.Headers.PRIVATE)));
       getUserMetadataAndVerify(blobId, option, expectedHeaders, usermetadata);
       getBlobInfoAndVerify(blobId, option, expectedHeaders, usermetadata);
       getHeadAndVerify(blobId, option, expectedHeaders);
@@ -582,10 +591,10 @@ public class AdminIntegrationTest {
       throws ExecutionException, InterruptedException {
     Queue<HttpObject> responseParts = nettyClient.sendRequest(httpRequest, null, null).get();
     HttpResponse response = (HttpResponse) responseParts.poll();
-    assertEquals("Unexpected response status", expectedStatusCode, response.getStatus());
-    assertTrue("No Date header", HttpHeaders.getDateHeader(response, HttpHeaders.Names.DATE, null) != null);
+    assertEquals("Unexpected response status", expectedStatusCode, response.status());
+    assertTrue("No Date header", response.headers().getTimeMillis(HttpHeaderNames.DATE, -1) != -1);
     discardContent(responseParts, 1);
-    assertTrue("Channel should be active", HttpHeaders.isKeepAlive(response));
+    assertTrue("Channel should be active", HttpUtil.isKeepAlive(response));
   }
 
   /**
@@ -593,7 +602,28 @@ public class AdminIntegrationTest {
    * @param receivedHeaders the {@link HttpHeaders} that were received.
    */
   private void checkCommonGetHeadHeaders(HttpHeaders receivedHeaders) {
-    assertTrue("No Date header", receivedHeaders.get(HttpHeaders.Names.DATE) != null);
-    assertTrue("No Last-Modified header", receivedHeaders.get(HttpHeaders.Names.LAST_MODIFIED) != null);
+    assertTrue("No Date header", receivedHeaders.get(HttpHeaderNames.DATE) != null);
+    assertTrue("No Last-Modified header", receivedHeaders.get(HttpHeaderNames.LAST_MODIFIED) != null);
+  }
+
+  /**
+   * Verifies that the right cache headers are returned.
+   * @param isPrivate {@code true} if the blob is private, {@code false} if not.
+   * @param response the {@link HttpResponse}.
+   */
+  private void verifyCacheHeaders(boolean isPrivate, HttpResponse response) {
+    if (isPrivate) {
+      Assert.assertEquals("Cache-Control value not as expected", "private, no-cache, no-store, proxy-revalidate",
+          response.headers().get(RestUtils.Headers.CACHE_CONTROL));
+      Assert.assertEquals("Pragma value not as expected", "no-cache", response.headers().get(RestUtils.Headers.PRAGMA));
+    } else {
+      String expiresValue = response.headers().get(RestUtils.Headers.EXPIRES);
+      assertNotNull("Expires value should be non null", expiresValue);
+      assertTrue("Expires value should be in future",
+          RestUtils.getTimeFromDateString(expiresValue) > System.currentTimeMillis());
+      Assert.assertEquals("Cache-Control value not as expected", "max-age=" + ADMIN_CONFIG.adminCacheValiditySeconds,
+          response.headers().get(RestUtils.Headers.CACHE_CONTROL));
+      Assert.assertNull("Pragma value should not have been set", response.headers().get(RestUtils.Headers.PRAGMA));
+    }
   }
 }

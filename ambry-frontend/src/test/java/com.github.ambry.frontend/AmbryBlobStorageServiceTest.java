@@ -48,6 +48,7 @@ import com.github.ambry.router.Router;
 import com.github.ambry.router.RouterErrorCode;
 import com.github.ambry.router.RouterException;
 import com.github.ambry.utils.Pair;
+import com.github.ambry.utils.TestUtils;
 import com.github.ambry.utils.Utils;
 import com.github.ambry.utils.UtilsTest;
 import java.io.IOException;
@@ -327,7 +328,7 @@ public class AmbryBlobStorageServiceTest {
   @Test
   public void postGetHeadDeleteTest() throws Exception {
     final int CONTENT_LENGTH = 1024;
-    ByteBuffer content = ByteBuffer.wrap(RestTestUtils.getRandomBytes(CONTENT_LENGTH));
+    ByteBuffer content = ByteBuffer.wrap(TestUtils.getRandomBytes(CONTENT_LENGTH));
     String serviceId = "postGetHeadDeleteServiceID";
     String contentType = "application/octet-stream";
     String ownerId = "postGetHeadDeleteOwnerID";
@@ -373,7 +374,7 @@ public class AmbryBlobStorageServiceTest {
   public void oldStyleUserMetadataTest() throws Exception {
     ByteBuffer content = ByteBuffer.allocate(0);
     BlobProperties blobProperties = new BlobProperties(0, "userMetadataTestOldStyleServiceID");
-    byte[] usermetadata = RestTestUtils.getRandomBytes(25);
+    byte[] usermetadata = TestUtils.getRandomBytes(25);
     String blobId = router.putBlob(blobProperties, usermetadata, new ByteBufferReadableStreamChannel(content)).get();
 
     RestUtils.SubResource[] subResources = {RestUtils.SubResource.UserMetadata, RestUtils.SubResource.BlobInfo};
@@ -735,11 +736,12 @@ public class AmbryBlobStorageServiceTest {
     MockRestResponseChannel restResponseChannel = new MockRestResponseChannel();
     doOperation(restRequest, restResponseChannel);
     assertEquals("Unexpected response status", ResponseStatus.NotModified, restResponseChannel.getStatus());
-    assertTrue("No Date header", restResponseChannel.getHeader(RestUtils.Headers.DATE) != null);
-    assertNull("No Last-Modified header expected", restResponseChannel.getHeader("Last-Modified"));
+    assertNotNull("Date header expected", restResponseChannel.getHeader(RestUtils.Headers.DATE));
+    assertNotNull("Last-Modified header expected", restResponseChannel.getHeader(RestUtils.Headers.LAST_MODIFIED));
     assertNull(RestUtils.Headers.BLOB_SIZE + " should have been null ",
         restResponseChannel.getHeader(RestUtils.Headers.BLOB_SIZE));
     assertNull("Content-Type should have been null", restResponseChannel.getHeader(RestUtils.Headers.CONTENT_TYPE));
+    assertNull("Content-Length should have been null", restResponseChannel.getHeader(RestUtils.Headers.CONTENT_LENGTH));
     assertEquals("No content expected as blob is not modified", 0, restResponseChannel.getResponseBody().length);
     assertNull("Accept-Ranges should not be set", restResponseChannel.getHeader(RestUtils.Headers.ACCEPT_RANGES));
     assertNull("Content-Range header should not be set",
