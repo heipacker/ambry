@@ -48,14 +48,13 @@ public class HardDeleter implements Runnable {
   public static final short Cleanup_Token_Version_V1 = 1;
   private static final String Cleanup_Token_Filename = "cleanuptoken";
   //how long to sleep if token does not advance.
-  static final long HARD_DELETE_SLEEP_TIME_ON_CAUGHT_UP = 10 * Time.MsPerSec;
+  static final long HARD_DELETE_SLEEP_TIME_ON_CAUGHT_UP_MS = 10 * Time.MsPerSec;
 
   final AtomicBoolean enabled = new AtomicBoolean(true);
 
   private final StoreMetrics metrics;
   private final String dataDir;
   private final Log log;
-  private final Offset logAbsoluteZeroOffset;
   private final PersistentIndex index;
   private final MessageStoreHardDelete hardDelete;
   private final StoreKeyFactory factory;
@@ -101,7 +100,6 @@ public class HardDeleter implements Runnable {
     this.metrics = metrics;
     this.dataDir = dataDir;
     this.log = log;
-    logAbsoluteZeroOffset = new Offset(log.getFirstSegment().getName(), 0);
     this.index = index;
     this.hardDelete = hardDelete;
     this.factory = factory;
@@ -114,16 +112,19 @@ public class HardDeleter implements Runnable {
   @Override
   public void run() {
     try {
+      logger.trace("Starting hard delete runnable for {}", dataDir);
       while (enabled.get()) {
         hardDeleteLock.lock();
         try {
           while (enabled.get() && isPaused()) {
+            logger.info("Hard delete entering pause state for {}", dataDir);
             pauseCondition.await();
           }
           if (enabled.get()) {
             if (!hardDelete()) {
               isCaughtUp = true;
-              time.await(pauseCondition, HARD_DELETE_SLEEP_TIME_ON_CAUGHT_UP);
+              logger.trace("Waiting for {} ms after caught up for {}", HARD_DELETE_SLEEP_TIME_ON_CAUGHT_UP_MS, dataDir);
+              time.await(pauseCondition, HARD_DELETE_SLEEP_TIME_ON_CAUGHT_UP_MS);
             } else if (isCaughtUp) {
               isCaughtUp = false;
               logger.info("Resumed hard deletes for {} after having caught up", dataDir);
@@ -174,6 +175,7 @@ public class HardDeleter implements Runnable {
       if (paused.compareAndSet(true, false)) {
         pauseCondition.signal();
       }
+      logger.info("Hard delete resumed for {}", dataDir);
     } finally {
       hardDeleteLock.unlock();
     }
@@ -286,13 +288,24 @@ public class HardDeleter implements Runnable {
    * @return true if the token moved forward, false otherwise.
    */
   boolean hardDelete() throws StoreException {
-    if (index.getCurrentEndOffset().compareTo(log.getStartOffset()) > 0) {
+    if (index.getCurrentEndOffset().compareTo(index.getStartOffset()) > 0) {
       final Timer.Context context = metrics.hardDeleteTime.time();
       try {
         FindInfo info =
             index.findDeletedEntriesSince(startToken, scanSizeInBytes, time.seconds() - messageRetentionSeconds);
         endToken = info.getFindToken();
+        logger.trace("New range for hard deletes : startToken {}, endToken for {}", startToken, info.getFindToken(),
+            dataDir);
         pruneHardDeleteRecoveryRange();
+        if (hardDeleteRecoveryRange.getSize() > 0) {
+          logger.trace("Pruned Hard delete recovery range : {} to {} with size {} for {}",
+              hardDeleteRecoveryRange.blobReadOptionsList.get(0),
+              hardDeleteRecoveryRange.getSize() > 1 ? hardDeleteRecoveryRange.getBlobReadOptionsList()
+                  .get(hardDeleteRecoveryRange.getSize() - 1) : hardDeleteRecoveryRange.getBlobReadOptionsList().get(0),
+              hardDeleteRecoveryRange.getSize(), dataDir);
+        } else {
+          logger.trace("Hard delete recovery range is empty for {}", dataDir);
+        }
         if (!endToken.equals(startToken)) {
           if (!info.getMessageEntries().isEmpty()) {
             performHardDeletes(info.getMessageEntries());
@@ -336,7 +349,7 @@ public class HardDeleter implements Runnable {
   long getProgress() {
     StoreFindToken token = (StoreFindToken) startToken;
     return token.getType().equals(StoreFindToken.Type.Uninitialized) ? 0
-        : log.getDifference(token.getOffset(), logAbsoluteZeroOffset);
+        : index.getAbsolutePositionInLogForOffset(token.getOffset());
   }
 
   /**
@@ -595,6 +608,7 @@ public class HardDeleter implements Runnable {
     } catch (IOException e) {
       throw new StoreException("IO exception while performing hard delete ", e, StoreErrorCodes.IOError);
     }
+    logger.trace("Performed hard deletes from {} to {} for {}", startToken, endToken, dataDir);
   }
 
   /**

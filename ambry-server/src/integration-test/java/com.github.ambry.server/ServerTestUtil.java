@@ -22,6 +22,7 @@ import com.github.ambry.clustermap.PartitionId;
 import com.github.ambry.clustermap.ReplicaId;
 import com.github.ambry.commons.BlobId;
 import com.github.ambry.commons.ByteBufferReadableStreamChannel;
+import com.github.ambry.commons.SSLFactory;
 import com.github.ambry.commons.ServerErrorCode;
 import com.github.ambry.config.ClusterMapConfig;
 import com.github.ambry.config.ConnectionPoolConfig;
@@ -66,7 +67,9 @@ import java.io.FileInputStream;
 import java.io.IOException;
 import java.io.InputStream;
 import java.nio.ByteBuffer;
+import java.security.GeneralSecurityException;
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.HashSet;
 import java.util.Iterator;
 import java.util.List;
@@ -253,8 +256,9 @@ public final class ServerTestUtil {
       // Use router to get the blob
       Properties routerProperties = getRouterProps(routerDatacenter);
       routerProperties.putAll(routerProps);
-      Router router = new NonBlockingRouterFactory(new VerifiableProperties(routerProperties), clusterMap,
-          new MockNotificationSystem(9)).getRouter();
+      VerifiableProperties routerVerifiableProps = new VerifiableProperties(routerProperties);
+      Router router = new NonBlockingRouterFactory(routerVerifiableProps, clusterMap, new MockNotificationSystem(9),
+          getSSLFactoryIfRequired(routerVerifiableProps)).getRouter();
       checkBlobId(router, blobId1, data);
       router.close();
 
@@ -277,6 +281,48 @@ public final class ServerTestUtil {
       e.printStackTrace();
       Assert.fail();
     }
+  }
+
+  /**
+   * Tests the case where a late PutRequest is sent to each server when it already has a record for the given BlobId.
+   * The expected error from each server should be the given error.
+   * @param blobId the {@link BlobId} of the blob to be put.
+   * @param properties the {@link BlobProperties} of the blob to be put.
+   * @param usermetadata the usermetadata of the blob to be put.
+   * @param data the blob data of the blob to be put.
+   * @param channelToDatanode1 the {@link BlockingChannel} to the Datanode1.
+   * @param channelToDatanode2 the {@link BlockingChannel} to the Datanode2.
+   * @param channelToDatanode3 the {@link BlockingChannel} to the Datanode3.
+   * @param expectedErrorCode the {@link ServerErrorCode} that is expected from every Datanode.
+   * @throws IOException
+   */
+  private static void testLatePutRequest(BlobId blobId, BlobProperties properties, byte[] usermetadata, byte[] data,
+      BlockingChannel channelToDatanode1, BlockingChannel channelToDatanode2, BlockingChannel channelToDatanode3,
+      ServerErrorCode expectedErrorCode) throws IOException {
+    // Send put requests for an existing blobId for the exact blob to simulate a request arriving late.
+    PutRequest latePutRequest1 =
+        new PutRequest(1, "client1", blobId, properties, ByteBuffer.wrap(usermetadata), ByteBuffer.wrap(data),
+            properties.getBlobSize(), BlobType.DataBlob);
+    PutRequest latePutRequest2 =
+        new PutRequest(1, "client2", blobId, properties, ByteBuffer.wrap(usermetadata), ByteBuffer.wrap(data),
+            properties.getBlobSize(), BlobType.DataBlob);
+    PutRequest latePutRequest3 =
+        new PutRequest(1, "client3", blobId, properties, ByteBuffer.wrap(usermetadata), ByteBuffer.wrap(data),
+            properties.getBlobSize(), BlobType.DataBlob);
+    channelToDatanode1.send(latePutRequest1);
+    InputStream putResponseStream = channelToDatanode1.receive().getInputStream();
+    PutResponse response = PutResponse.readFrom(new DataInputStream(putResponseStream));
+    assertEquals(expectedErrorCode, response.getError());
+
+    channelToDatanode2.send(latePutRequest2);
+    putResponseStream = channelToDatanode2.receive().getInputStream();
+    response = PutResponse.readFrom(new DataInputStream(putResponseStream));
+    assertEquals(expectedErrorCode, response.getError());
+
+    channelToDatanode3.send(latePutRequest3);
+    putResponseStream = channelToDatanode3.receive().getInputStream();
+    response = PutResponse.readFrom(new DataInputStream(putResponseStream));
+    assertEquals(expectedErrorCode, response.getError());
   }
 
   protected static void endToEndReplicationWithMultiNodeMultiPartitionTest(int interestedDataNodePortNumber,
@@ -334,6 +380,25 @@ public final class ServerTestUtil {
       for (BlobId blobId : blobIds) {
         notificationSystem.awaitBlobCreations(blobId.getID());
       }
+
+      // Now that the blob is created and replicated, test the cases where a put request arrives for the same blob id
+      // later than replication.
+      // @todo Once PutRequest starts going out in V3, ReplicaMetadataResponse goes out in V2 and GetResponse goes
+      // @todo out in V2, the expected error is No_Error for the first case here, where the blob is exactly the same.
+      testLatePutRequest(blobIds.get(0), properties, usermetadata, data, channel1, channel2, channel3,
+          ServerErrorCode.Blob_Already_Exists);
+      // Test the case where a put arrives with the same id as one in the server, but the blob is not identical.
+      BlobProperties differentProperties = new BlobProperties(properties.getBlobSize(), properties.getServiceId());
+      testLatePutRequest(blobIds.get(0), differentProperties, usermetadata, data, channel1, channel2, channel3,
+          ServerErrorCode.Blob_Already_Exists);
+      byte[] differentUsermetadata = Arrays.copyOf(usermetadata, usermetadata.length);
+      differentUsermetadata[0] = (byte) ~differentUsermetadata[0];
+      testLatePutRequest(blobIds.get(0), properties, differentUsermetadata, data, channel1, channel2, channel3,
+          ServerErrorCode.Blob_Already_Exists);
+      byte[] differentData = Arrays.copyOf(data, data.length);
+      differentData[0] = (byte) ~differentData[0];
+      testLatePutRequest(blobIds.get(0), properties, usermetadata, differentData, channel1, channel2, channel3,
+          ServerErrorCode.Blob_Already_Exists);
 
       // verify blob properties, metadata and blob across all nodes
       for (int i = 0; i < 3; i++) {
@@ -706,8 +771,8 @@ public final class ServerTestUtil {
     props.setProperty("router.put.success.target", "1");
     props.putAll(routerProps);
     VerifiableProperties verifiableProperties = new VerifiableProperties(props);
-    Router router =
-        new NonBlockingRouterFactory(verifiableProperties, cluster.getClusterMap(), notificationSystem).getRouter();
+    Router router = new NonBlockingRouterFactory(verifiableProperties, cluster.getClusterMap(), notificationSystem,
+        getSSLFactoryIfRequired(verifiableProperties)).getRouter();
     int numberOfRequestsToSend = 15;
     int numberOfVerifierThreads = 3;
     final LinkedBlockingQueue<Payload> payloadQueue = new LinkedBlockingQueue<Payload>();
@@ -716,7 +781,8 @@ public final class ServerTestUtil {
     List<Future<String>> putFutures = new ArrayList<>(numberOfRequestsToSend);
     for (int i = 0; i < numberOfRequestsToSend; i++) {
       int size = new Random().nextInt(5000);
-      final BlobProperties properties = new BlobProperties(size, "service1", "owner id check", "image/jpeg", false);
+      final BlobProperties properties =
+          new BlobProperties(size, "service1", "owner id check", "image/jpeg", false, Utils.Infinite_Time);
       final byte[] metadata = new byte[new Random().nextInt(1000)];
       final byte[] blob = new byte[size];
       new Random().nextBytes(metadata);
@@ -926,8 +992,9 @@ public final class ServerTestUtil {
       // Use router to get the blob
       Properties routerProperties = getRouterProps(routerDatacenter);
       routerProperties.putAll(routerProps);
-      Router router = new NonBlockingRouterFactory(new VerifiableProperties(routerProperties), clusterMap,
-          notificationSystem).getRouter();
+      VerifiableProperties routerVerifiableProperties = new VerifiableProperties(routerProperties);
+      Router router = new NonBlockingRouterFactory(routerVerifiableProperties, clusterMap, notificationSystem,
+          getSSLFactoryIfRequired(routerVerifiableProperties)).getRouter();
       checkBlobId(router, blobId1, data);
       checkBlobId(router, blobId2, data);
       checkBlobId(router, blobId3, data);
@@ -1292,5 +1359,18 @@ public final class ServerTestUtil {
           sslSocketFactory, sslConfig);
     }
     return channel;
+  }
+
+  /**
+   * Create an {@link SSLFactory} if there are SSL enabled datacenters in the properties
+   * @param verifiableProperties the {@link VerifiableProperties} to use.
+   * @return an {@link SSLFactory}, or {@code null}, if no {@link SSLFactory} is required.
+   * @throws GeneralSecurityException
+   * @throws IOException
+   */
+  static SSLFactory getSSLFactoryIfRequired(VerifiableProperties verifiableProperties)
+      throws GeneralSecurityException, IOException {
+    boolean requiresSSL = new ClusterMapConfig(verifiableProperties).clusterMapSslEnabledDatacenters.length() > 0;
+    return requiresSSL ? new SSLFactory(new SSLConfig(verifiableProperties)) : null;
   }
 }

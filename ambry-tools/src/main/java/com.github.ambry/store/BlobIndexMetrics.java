@@ -21,6 +21,7 @@ import com.github.ambry.messageformat.BlobStoreRecovery;
 import com.github.ambry.utils.SystemTime;
 import java.io.FileWriter;
 import java.util.Random;
+import java.util.UUID;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.atomic.AtomicLong;
 
@@ -39,7 +40,7 @@ class BlobIndexMetrics extends PersistentIndex {
       AtomicLong totalWrites, AtomicLong totalTimeTaken, AtomicLong totalReads, StoreConfig config, FileWriter writer,
       StoreKeyFactory factory) throws StoreException {
     super(datadir, scheduler, log, config, factory, new BlobStoreRecovery(), new BlobStoreHardDelete(),
-        new StoreMetrics(datadir, new MetricRegistry()), SystemTime.getInstance(), null);
+        new StoreMetrics(datadir, new MetricRegistry()), SystemTime.getInstance(), UUID.randomUUID(), null);
     this.enableVerboseLogging = enableVerboseLogging;
     this.lastOffsetUsed = new AtomicLong(0);
     this.totalWrites = totalWrites;
@@ -54,7 +55,8 @@ class BlobIndexMetrics extends PersistentIndex {
     synchronized (lock) {
       long startTimeInMs = System.currentTimeMillis();
       long size = new Random().nextInt(10000);
-      IndexEntry entry = new IndexEntry(id, new IndexValue(size, new Offset("", lastOffsetUsed.get()), (byte) 1, 1000));
+      IndexEntry entry = new IndexEntry(id, new IndexValue(size, new Offset("", lastOffsetUsed.get()), (byte) 1, 1000,
+          SystemTime.getInstance().seconds()));
       lastOffsetUsed.addAndGet(size);
       long offset = getCurrentEndOffset().getOffset();
       addToIndex(entry, new FileSpan(new Offset("", offset), new Offset("", offset + entry.getValue().getSize())));
@@ -77,7 +79,7 @@ class BlobIndexMetrics extends PersistentIndex {
     }
     totalWrites.incrementAndGet();
     if (totalWrites.get() % 1000 == 0) {
-      System.out.println("number of indexes created " + indexes.size());
+      System.out.println("number of indexes created " + getIndexSegments().size());
     }
   }
 }

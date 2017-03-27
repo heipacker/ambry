@@ -19,6 +19,7 @@ import com.github.ambry.clustermap.ClusterMapManager;
 import com.github.ambry.config.ClusterMapConfig;
 import com.github.ambry.config.StoreConfig;
 import com.github.ambry.config.VerifiableProperties;
+import com.github.ambry.utils.SystemTime;
 import com.github.ambry.utils.Utils;
 import java.io.File;
 import java.io.IOException;
@@ -65,7 +66,7 @@ public class DumpIndexTool {
   // True if blob stats needs to be logged, false otherwise
   private final boolean logBlobStats;
 
-  private static final Logger logger = LoggerFactory.getLogger(DumpDataTool.class);
+  private static final Logger logger = LoggerFactory.getLogger(DumpIndexTool.class);
 
   public DumpIndexTool(VerifiableProperties verifiableProperties) throws IOException, JSONException {
     fileToRead = verifiableProperties.getString("file.to.read");
@@ -75,8 +76,8 @@ public class DumpIndexTool {
     blobIdList = verifiableProperties.getString("blobId.list", "");
     replicaRootDirecotry = verifiableProperties.getString("replica.root.directory");
     activeBlobsCount = verifiableProperties.getInt("active.blobs.count", -1);
-    activeBlobsOnly = verifiableProperties.getBoolean("active.blobs.only");
-    logBlobStats = verifiableProperties.getBoolean("log.blob.stats");
+    activeBlobsOnly = verifiableProperties.getBoolean("active.blobs.only", false);
+    logBlobStats = verifiableProperties.getBoolean("log.blob.stats", false);
     if (!new File(hardwareLayoutFilePath).exists() || !new File(partitionLayoutFilePath).exists()) {
       throw new IllegalArgumentException("Hardware or Partition Layout file does not exist");
     }
@@ -110,7 +111,7 @@ public class DumpIndexTool {
     }
 
     switch (typeOfOperation) {
-      case "DumpIndexTool":
+      case "DumpIndexFile":
         if (activeBlobsOnly) {
           dumpActiveBlobsFromIndex(new File(fileToRead), blobs);
         } else {
@@ -160,7 +161,7 @@ public class DumpIndexTool {
         logger.trace(blobIdToMessageMapPerIndexFile.get(key).toString());
         IndexValue indexValue = blobIdToMessageMapPerIndexFile.get(key);
         if (blobIdToStatusMap == null) {
-          logger.info(indexValue.toString());
+          logger.info(key + " : " + indexValue.toString());
           if (isDeleted(indexValue) || DumpDataHelper.isExpired(indexValue.getExpiresAtMs())) {
             indexStats.incrementTotalDeleteRecords();
           } else {
@@ -232,8 +233,8 @@ public class DumpIndexTool {
     logger.info("Root directory for replica : " + replicaRootDirectory);
     IndexStats indexStats = new IndexStats();
     Map<String, BlobStatus> blobIdToStatusMap = new HashMap<>();
-    File[] replicas = replicaDirectory.listFiles(PersistentIndex.INDEX_FILE_FILTER);
-    Arrays.sort(replicas, PersistentIndex.INDEX_FILE_COMPARATOR);
+    File[] replicas = replicaDirectory.listFiles(PersistentIndex.INDEX_SEGMENT_FILE_FILTER);
+    Arrays.sort(replicas, PersistentIndex.INDEX_SEGMENT_FILE_COMPARATOR);
     for (File indexFile : replicas) {
       logger.info("Dumping index " + indexFile + " for replica " + replicaDirectory.getName());
       totalKeysProcessed +=
@@ -342,8 +343,8 @@ public class DumpIndexTool {
     File replicaDirectory = new File(replicaRootDirectory);
     Map<String, IndexValue> blobIdToMessageMap = new HashMap<>();
     ActiveBlobStats activeBlobStats = new ActiveBlobStats();
-    File[] replicas = replicaDirectory.listFiles(PersistentIndex.INDEX_FILE_FILTER);
-    Arrays.sort(replicas, PersistentIndex.INDEX_FILE_COMPARATOR);
+    File[] replicas = replicaDirectory.listFiles(PersistentIndex.INDEX_SEGMENT_FILE_FILTER);
+    Arrays.sort(replicas, PersistentIndex.INDEX_SEGMENT_FILE_COMPARATOR);
     for (File indexFile : replicas) {
       logger.info("Dumping index " + indexFile.getName() + " for " + replicaDirectory.getName());
       totalKeysProcessed += dumpActiveBlobsFromIndex(indexFile, blobList, blobIdToMessageMap, activeBlobStats);
@@ -381,8 +382,8 @@ public class DumpIndexTool {
     File replicaDirectory = new File(replicaRootDirectory);
     Map<String, IndexValue> blobIdToBlobMessageMap = new HashMap<>();
     ActiveBlobStats activeBlobStats = new ActiveBlobStats();
-    File[] replicas = replicaDirectory.listFiles(PersistentIndex.INDEX_FILE_FILTER);
-    Arrays.sort(replicas, PersistentIndex.INDEX_FILE_COMPARATOR);
+    File[] replicas = replicaDirectory.listFiles(PersistentIndex.INDEX_SEGMENT_FILE_FILTER);
+    Arrays.sort(replicas, PersistentIndex.INDEX_SEGMENT_FILE_COMPARATOR);
     for (File indexFile : replicas) {
       logger.trace("Dumping index {} for {} ", indexFile.getName(), replicaDirectory.getName());
       totalKeysProcessed += dumpActiveBlobsFromIndex(indexFile, blobList, blobIdToBlobMessageMap, activeBlobStats);
@@ -421,7 +422,7 @@ public class DumpIndexTool {
     StoreConfig config = new StoreConfig(new VerifiableProperties(new Properties()));
     StoreMetrics metrics = new StoreMetrics(indexFileToDump.getParent(), new MetricRegistry());
     IndexSegment segment = new IndexSegment(indexFileToDump, false, storeKeyFactory, config, metrics,
-        new Journal(indexFileToDump.getParent(), 0, 0));
+        new Journal(indexFileToDump.getParent(), 0, 0), SystemTime.getInstance());
     List<MessageInfo> entries = new ArrayList<>();
     segment.getEntriesSince(null, new FindEntriesCondition(Long.MAX_VALUE), entries, new AtomicLong(0));
     long numberOfKeysProcessed = 0;

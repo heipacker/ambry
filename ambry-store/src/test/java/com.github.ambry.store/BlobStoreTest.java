@@ -38,6 +38,7 @@ import java.util.Iterator;
 import java.util.List;
 import java.util.Map;
 import java.util.Properties;
+import java.util.Random;
 import java.util.Set;
 import java.util.concurrent.Callable;
 import java.util.concurrent.ConcurrentHashMap;
@@ -75,8 +76,10 @@ public class BlobStoreTest {
   private static final long SEGMENT_CAPACITY = 2000;
   private static final int MAX_IN_MEM_ELEMENTS = 5;
   // deliberately do not divide the capacities perfectly.
-  private static final long PUT_RECORD_SIZE = 53;
-  private static final long DELETE_RECORD_SIZE = 29;
+  private static final int PUT_RECORD_SIZE = 53;
+  private static final int DELETE_RECORD_SIZE = 29;
+
+  private final Random random = new Random();
 
   /**
    * A mock implementation of {@link MessageWriteSet} to help write to the {@link BlobStore}
@@ -359,9 +362,9 @@ public class BlobStoreTest {
    */
   @Test
   public void basicTest() throws InterruptedException, IOException, StoreException {
-    // PUT a key that is slated to expire when time advances by 2ms
-    MockId addedId = put(1, PUT_RECORD_SIZE, time.milliseconds() + 1).get(0);
-    time.sleep(2);
+    // PUT a key that is slated to expire when time advances by 1s
+    MockId addedId = put(1, PUT_RECORD_SIZE, time.seconds() + 1).get(0);
+    time.sleep(2 * Time.MsPerSec);
     liveKeys.remove(addedId);
     expiredKeys.add(addedId);
 
@@ -412,8 +415,8 @@ public class BlobStoreTest {
    */
   @Test
   public void concurrentPutTest() throws Exception {
-    long blobCount = 4000 / PUT_RECORD_SIZE + 1;
-    List<Putter> putters = new ArrayList<>((int) blobCount);
+    int blobCount = 4000 / PUT_RECORD_SIZE + 1;
+    List<Putter> putters = new ArrayList<>(blobCount);
     for (int i = 0; i < blobCount; i++) {
       putters.add(new Putter());
     }
@@ -428,8 +431,8 @@ public class BlobStoreTest {
    */
   @Test
   public void concurrentGetTest() throws Exception {
-    long extraBlobCount = 4000 / PUT_RECORD_SIZE + 1;
-    put((int) extraBlobCount, PUT_RECORD_SIZE, Utils.Infinite_Time);
+    int extraBlobCount = 4000 / PUT_RECORD_SIZE + 1;
+    put(extraBlobCount, PUT_RECORD_SIZE, Utils.Infinite_Time);
     List<Getter> getters = new ArrayList<>(allKeys.size());
     for (MockId id : allKeys.keySet()) {
       getters.add(new Getter(id, EnumSet.noneOf(StoreGetOptions.class)));
@@ -445,8 +448,8 @@ public class BlobStoreTest {
    */
   @Test
   public void concurrentDeleteTest() throws Exception {
-    long extraBlobCount = 2000 / PUT_RECORD_SIZE + 1;
-    put((int) extraBlobCount, PUT_RECORD_SIZE, Utils.Infinite_Time);
+    int extraBlobCount = 2000 / PUT_RECORD_SIZE + 1;
+    put(extraBlobCount, PUT_RECORD_SIZE, Utils.Infinite_Time);
     List<Deleter> deleters = new ArrayList<>(liveKeys.size());
     for (MockId id : liveKeys) {
       deleters.add(new Deleter(id));
@@ -462,8 +465,8 @@ public class BlobStoreTest {
    */
   @Test
   public void concurrentAllTest() throws Exception {
-    long putBlobCount = 1500 / PUT_RECORD_SIZE + 1;
-    List<Putter> putters = new ArrayList<>((int) putBlobCount);
+    int putBlobCount = 1500 / PUT_RECORD_SIZE + 1;
+    List<Putter> putters = new ArrayList<>(putBlobCount);
     for (int i = 0; i < putBlobCount; i++) {
       putters.add(new Putter());
     }
@@ -473,9 +476,9 @@ public class BlobStoreTest {
       getters.add(new Getter(id, EnumSet.allOf(StoreGetOptions.class)));
     }
 
-    long deleteBlobCount = 1500 / PUT_RECORD_SIZE;
-    List<MockId> idsToDelete = put((int) deleteBlobCount, PUT_RECORD_SIZE, Utils.Infinite_Time);
-    List<Deleter> deleters = new ArrayList<>((int) deleteBlobCount);
+    int deleteBlobCount = 1500 / PUT_RECORD_SIZE;
+    List<MockId> idsToDelete = put(deleteBlobCount, PUT_RECORD_SIZE, Utils.Infinite_Time);
+    List<Deleter> deleters = new ArrayList<>(deleteBlobCount);
     for (MockId id : idsToDelete) {
       deleters.add(new Deleter(id));
     }
@@ -514,6 +517,88 @@ public class BlobStoreTest {
     verifyDeleteFailure(deletedKeys.iterator().next(), StoreErrorCodes.ID_Deleted);
     // ID that does not exist
     verifyDeleteFailure(getUniqueId(), StoreErrorCodes.ID_Not_Found);
+  }
+
+  /**
+   * Test various duplicate and collision cases for {@link BlobStore#put(MessageWriteSet)}
+   * @throws Exception
+   */
+  @Test
+  public void idCollisionTest() throws Exception {
+    // Populate global lists of keys and crcs.
+    List<StoreKey> allMockIdList = new ArrayList<>();
+    List<Long> allCrcList = new ArrayList<>();
+    for (long i = 0; i < 4; i++) {
+      allMockIdList.add(new MockId(Long.toString(i)));
+      allCrcList.add(i);
+    }
+
+    // Put the initial two messages.
+    List<StoreKey> mockIdList = Arrays.asList(allMockIdList.get(0), allMockIdList.get(1));
+    List<Long> crcList = Arrays.asList(allCrcList.get(0), allCrcList.get(1));
+    Set<StoreKey> missingKeysAfter = new HashSet<>(Arrays.asList(allMockIdList.get(2), allMockIdList.get(3)));
+    putWithKeysAndCrcs(mockIdList, crcList);
+    assertEquals(missingKeysAfter, store.findMissingKeys(allMockIdList));
+
+    // 1. SOME_NOT_ALL_DUPLICATE - should fail.
+    // first one duplicate, second one absent.
+    mockIdList = Arrays.asList(allMockIdList.get(0), allMockIdList.get(2));
+    crcList = Arrays.asList(allCrcList.get(0), allCrcList.get(2));
+    try {
+      putWithKeysAndCrcs(mockIdList, crcList);
+      fail("Put should fail if some keys exist, but some do not");
+    } catch (StoreException e) {
+      assertEquals(StoreErrorCodes.Already_Exist, e.getErrorCode());
+    }
+    assertEquals(missingKeysAfter, store.findMissingKeys(allMockIdList));
+
+    // first one absent, second one duplicate.
+    mockIdList = Arrays.asList(allMockIdList.get(2), allMockIdList.get(0));
+    crcList = Arrays.asList(allCrcList.get(2), allCrcList.get(0));
+    try {
+      putWithKeysAndCrcs(mockIdList, crcList);
+      fail("Put should fail if some keys exist, but some do not");
+    } catch (StoreException e) {
+      assertEquals(StoreErrorCodes.Already_Exist, e.getErrorCode());
+    }
+    assertEquals(missingKeysAfter, store.findMissingKeys(allMockIdList));
+
+    // 2. COLLIDING - should fail.
+    // first one duplicate, second one colliding.
+    mockIdList = Arrays.asList(allMockIdList.get(0), allMockIdList.get(1));
+    crcList = Arrays.asList(allCrcList.get(0), allCrcList.get(2));
+    try {
+      putWithKeysAndCrcs(mockIdList, crcList);
+      fail("Put should fail if some keys exist, but some do not");
+    } catch (StoreException e) {
+      assertEquals(StoreErrorCodes.Already_Exist, e.getErrorCode());
+    }
+    assertEquals(missingKeysAfter, store.findMissingKeys(allMockIdList));
+
+    // first one absent, second one colliding.
+    mockIdList = Arrays.asList(allMockIdList.get(3), allMockIdList.get(1));
+    crcList = Arrays.asList(allCrcList.get(3), allCrcList.get(2));
+    try {
+      putWithKeysAndCrcs(mockIdList, crcList);
+      fail("Put should fail if some keys exist, but some do not");
+    } catch (StoreException e) {
+      assertEquals(StoreErrorCodes.Already_Exist, e.getErrorCode());
+    }
+    assertEquals(missingKeysAfter, store.findMissingKeys(allMockIdList));
+
+    // 3. ALL_DUPLICATE - should succeed.
+    mockIdList = Arrays.asList(allMockIdList.get(0), allMockIdList.get(1));
+    crcList = Arrays.asList(allCrcList.get(0), allCrcList.get(1));
+    putWithKeysAndCrcs(mockIdList, crcList);
+    assertEquals(missingKeysAfter, store.findMissingKeys(allMockIdList));
+
+    // 4. ALL_ABSENT
+    mockIdList = Arrays.asList(allMockIdList.get(2), allMockIdList.get(3));
+    crcList = Arrays.asList(allCrcList.get(2), allCrcList.get(3));
+    putWithKeysAndCrcs(mockIdList, crcList);
+    // Ensure that all new entries were added.
+    missingKeysAfter.clear();
+    assertEquals(missingKeysAfter, store.findMissingKeys(allMockIdList));
   }
 
   /**
@@ -619,7 +704,8 @@ public class BlobStoreTest {
     List<ByteBuffer> buffers = new ArrayList<>(count);
     for (int i = 0; i < count; i++) {
       MockId id = getUniqueId();
-      MessageInfo info = new MessageInfo(id, size, expiresAtMs);
+      long crc = random.nextLong();
+      MessageInfo info = new MessageInfo(id, size, false, expiresAtMs, crc);
       ByteBuffer buffer = ByteBuffer.wrap(TestUtils.getRandomBytes((int) size));
       ids.add(id);
       infos.add(info);
@@ -643,7 +729,7 @@ public class BlobStoreTest {
    */
   private MessageInfo delete(MockId idToDelete) throws StoreException {
     MessageInfo info = new MessageInfo(idToDelete, DELETE_RECORD_SIZE);
-    ByteBuffer buffer = ByteBuffer.allocate((int) DELETE_RECORD_SIZE);
+    ByteBuffer buffer = ByteBuffer.allocate(DELETE_RECORD_SIZE);
     store.delete(new MockMessageWriteSet(Collections.singletonList(info), Collections.singletonList(buffer)));
     deletedKeys.add(idToDelete);
     return info;
@@ -666,7 +752,9 @@ public class BlobStoreTest {
       MockId id = (MockId) messageInfo.getStoreKey();
       MessageInfo expectedInfo = allKeys.get(id).getFirst();
       assertEquals("Unexpected size in MessageInfo", expectedInfo.getSize(), messageInfo.getSize());
-      assertEquals("Unexpected expiresAtMs in MessageInfo", expectedInfo.getExpirationTimeInMs(),
+      assertEquals("Unexpected expiresAtMs in MessageInfo",
+          (expectedInfo.getExpirationTimeInMs() != Utils.Infinite_Time ?
+              (expectedInfo.getExpirationTimeInMs() / Time.MsPerSec) * Time.MsPerSec : Utils.Infinite_Time),
           messageInfo.getExpirationTimeInMs());
 
       assertEquals("Unexpected key in readSet", id, readSet.getKeyAt(i));
@@ -715,25 +803,25 @@ public class BlobStoreTest {
         new BlobStore(storeId, config, scheduler, diskIOScheduler, metrics, tempDirStr, LOG_CAPACITY, STORE_KEY_FACTORY,
             recovery, hardDelete, time);
     store.start();
-    // advance time by a millisecond in order to be able to add expired keys and to avoid keys that are expired from
+    // advance time by a second in order to be able to add expired keys and to avoid keys that are expired from
     // being picked for delete.
-    time.sleep(1);
+    time.sleep(Time.MsPerSec);
     long expectedStoreSize;
     if (!isLogSegmented) {
       // log is filled about ~50%.
       expectedStoreSize = segmentCapacity / 2;
-      addCuratedData(expectedStoreSize, 0);
+      addCuratedData(expectedStoreSize);
     } else {
       expectedStoreSize = segmentCapacity;
       // first log segment is filled to capacity.
-      addCuratedData(segmentCapacity, 0);
+      addCuratedData(segmentCapacity);
       assertEquals("Store size not as expected", expectedStoreSize, store.getSizeInBytes());
 
       // second log segment is filled but has some space at the end (free space has to be less than the lesser of the
       // standard delete and put record sizes so that the next write causes a roll over of log segments).
       long sizeToWrite = segmentCapacity - (DELETE_RECORD_SIZE - 1);
       expectedStoreSize += sizeToWrite;
-      addCuratedData(sizeToWrite, 1);
+      addCuratedData(sizeToWrite);
       assertEquals("Store size not as expected", expectedStoreSize, store.getSizeInBytes());
 
       // third log segment is partially filled and is left as the "active" segment
@@ -773,10 +861,9 @@ public class BlobStoreTest {
    * Adds some curated data into the store in order to ensure a good mix for testing. For understanding the created
    * store, please read the source code which is annotated with comments.
    * @param sizeToWrite the size to add for.
-   * @param logSegmentIndex the index of the log segment being written to (0 being the first one).
    * @throws StoreException
    */
-  private void addCuratedData(long sizeToWrite, int logSegmentIndex) throws StoreException {
+  private void addCuratedData(long sizeToWrite) throws StoreException {
     Set<MockId> idsInLogSegment = new HashSet<>();
     idsByLogSegment.add(idsInLogSegment);
     List<Set<MockId>> idsGroupedByIndexSegment = new ArrayList<>();
@@ -1070,9 +1157,35 @@ public class BlobStoreTest {
     }
 
     try {
+      blobStore.getLogSegmentsNotInJournal();
+      fail("Operation should have failed because store is inactive");
+    } catch (StoreException e) {
+      assertEquals("Unexpected StoreErrorCode", StoreErrorCodes.Store_Not_Started, e.getErrorCode());
+    }
+
+    try {
       blobStore.shutdown();
     } catch (StoreException e) {
       assertEquals("Unexpected StoreErrorCode", StoreErrorCodes.Store_Not_Started, e.getErrorCode());
     }
+  }
+
+  /**
+   * Attempt to write a set of messages with keys and crcs from the given lists of keys and crcs.
+   * @param mockIdList the list of keys of the messages.
+   * @param crcList the list of crcs of the messages.
+   * @throws StoreException
+   */
+  private void putWithKeysAndCrcs(List<StoreKey> mockIdList, List<Long> crcList) throws StoreException {
+    List<ByteBuffer> bufferList = new ArrayList<>();
+    List<MessageInfo> messageInfoList = new ArrayList<>();
+    for (int i = 0; i < mockIdList.size(); i++) {
+      bufferList.add(ByteBuffer.allocate(PUT_RECORD_SIZE));
+      messageInfoList.add(
+          new MessageInfo(mockIdList.get(i), PUT_RECORD_SIZE, false, Utils.Infinite_Time, crcList.get(i)));
+    }
+    MessageWriteSet writeSet = new MockMessageWriteSet(messageInfoList, bufferList);
+    // Put the initial two messages.
+    store.put(writeSet);
   }
 }

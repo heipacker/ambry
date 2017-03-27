@@ -73,6 +73,7 @@ import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.Future;
 import java.util.concurrent.ThreadLocalRandom;
 import java.util.concurrent.TimeUnit;
+import javax.net.ssl.SSLSession;
 import org.json.JSONException;
 import org.json.JSONObject;
 import org.junit.After;
@@ -484,6 +485,27 @@ public class AmbryBlobStorageServiceTest {
       assertEquals("Unexpected error code", RestServiceErrorCode.InvalidArgs, e.getErrorCode());
     }
   }
+
+  /**
+   * Test that the correct service ID is sent to the router on deletes.
+   * @throws Exception
+   */
+  @Test
+  public void deleteServiceIdTest() throws Exception {
+    FrontendTestRouter testRouter = new FrontendTestRouter();
+    ambryBlobStorageService =
+        new AmbryBlobStorageService(frontendConfig, frontendMetrics, responseHandler, testRouter, idConverterFactory,
+            securityServiceFactory);
+    ambryBlobStorageService.start();
+    JSONObject headers = new JSONObject();
+    String serviceId = "service-id";
+    headers.put(RestUtils.Headers.SERVICE_ID, serviceId);
+    doOperation(createRestRequest(RestMethod.DELETE, "/", headers, null), new MockRestResponseChannel());
+    assertEquals(serviceId, testRouter.deleteServiceId);
+    doOperation(createRestRequest(RestMethod.DELETE, "/", null, null), new MockRestResponseChannel());
+    assertNull("Service ID should not have been set for this delete", testRouter.deleteServiceId);
+  }
+
   // helpers
   // general
 
@@ -1321,6 +1343,11 @@ class BadRestRequest extends BadRSC implements RestRequest {
   }
 
   @Override
+  public SSLSession getSSLSession() {
+    return null;
+  }
+
+  @Override
   public void prepare() {
     throw new IllegalStateException("Not implemented");
   }
@@ -1383,6 +1410,7 @@ class FrontendTestRouter implements Router {
   public OpType exceptionOpType = null;
   public Exception exceptionToReturn = null;
   public RuntimeException exceptionToThrow = null;
+  public String deleteServiceId = null;
 
   @Override
   public Future<GetBlobResult> getBlob(String blobId, GetBlobOptions options) {
@@ -1419,12 +1447,13 @@ class FrontendTestRouter implements Router {
   }
 
   @Override
-  public Future<Void> deleteBlob(String blobId) {
-    return deleteBlob(blobId, null);
+  public Future<Void> deleteBlob(String blobId, String serviceId) {
+    return deleteBlob(blobId, serviceId, null);
   }
 
   @Override
-  public Future<Void> deleteBlob(String blobId, Callback<Void> callback) {
+  public Future<Void> deleteBlob(String blobId, String serviceId, Callback<Void> callback) {
+    deleteServiceId = serviceId;
     return completeOperation(null, callback, OpType.DeleteBlob);
   }
 
